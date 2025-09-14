@@ -1,27 +1,39 @@
 {
-  "name": "stock-market-simulator-backend",
+  "name": "trading-simulation-backend",
   "version": "1.0.0",
-  "description": "Real-time stock market simulator backend with WebSocket support",
+  "description": "Stock Market Trading Simulation Backend with WebSocket support",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "test": "python test.py",
+    "quick-test": "python quick_test.py"
   },
+  "keywords": [
+    "stock",
+    "trading",
+    "simulation",
+    "websocket",
+    "real-time",
+    "supabase"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.4",
-    "compression": "^1.8.1",
+    "@supabase/supabase-js": "^2.39.0",
+    "compression": "^1.7.4",
     "cors": "^2.8.5",
-    "dotenv": "^16.6.1",
-    "express": "^4.21.2",
-    "helmet": "^7.2.0",
-    "socket.io": "^4.8.1",
-    "websocket-client": "^1.0.0"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.7.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC"
+  }
 }
