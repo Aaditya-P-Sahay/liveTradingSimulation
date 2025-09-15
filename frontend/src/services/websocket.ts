@@ -1,99 +1,97 @@
-// src/services/websocket.ts
 import { io, Socket } from 'socket.io-client';
 
-export interface StockTick {
-  symbol: string;
+interface StockTick {
   data: {
-    unique_id: number;
-    timestamp: string;
-    normalized_timestamp: string;
     symbol: string;
-    company_name: string;
+    timestamp: string;
     last_traded_price: number;
-    volume_traded: number;
+    open_price: number;
     high_price: number;
     low_price: number;
-    close_price: number;
-    open_price: number;
-    average_traded_price: number;
   };
-  timestamp: string;
-  index: number;
-  total: number;
 }
 
-export interface HistoricalDataResponse {
+interface HistoricalDataResponse {
   symbol: string;
-  data: StockTick['data'][];
-  total: number;
+  data: Array<{
+    timestamp: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  }>;
 }
 
 class WebSocketService {
   private socket: Socket | null = null;
-  private subscribers = new Map<string, Set<(data: StockTick) => void>>();
-  private historicalSubscribers = new Map<string, Set<(data: HistoricalDataResponse) => void>>();
-  private connectionCallbacks = new Set<(connected: boolean) => void>();
+  private subscriptions: Map<string, Set<(data: StockTick) => void>> = new Map();
+  private historicalSubscriptions: Map<string, Set<(data: HistoricalDataResponse) => void>> = new Map();
+  private connectionListeners: Set<(connected: boolean) => void> = new Set();
   private currentSymbol: string | null = null;
 
-  connect(serverUrl: string = 'http://localhost:3001') {
-    if (this.socket?.connected) {
-      return;
-    }
+  connect(url: string) {
+    if (this.socket) return;
 
-    this.socket = io(serverUrl, {
-      transports: ['websocket', 'polling'],
-      forceNew: true,
+    this.socket = io(url, {
       reconnection: true,
-      timeout: 20000,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
     });
 
     this.socket.on('connect', () => {
-      console.log('✅ Connected to WebSocket server');
-      this.connectionCallbacks.forEach(callback => callback(true));
+      console.log('WebSocket connected');
+      this.notifyConnectionListeners(true);
     });
 
     this.socket.on('disconnect', () => {
-      console.log('❌ Disconnected from WebSocket server');
-      this.connectionCallbacks.forEach(callback => callback(false));
+      console.log('WebSocket disconnected');
+      this.notifyConnectionListeners(false);
     });
 
-    this.socket.on('connect_error', (error) => {
-      console.error('Connection error:', error);
-      this.connectionCallbacks.forEach(callback => callback(false));
+    this.socket.on('stock_tick', (tick: StockTick) => {
+      this.handleTick(tick);
     });
 
-    // Handle real-time stock ticks
-    this.socket.on('tick', (data: StockTick) => {
-      const callbacks = this.subscribers.get(data.symbol);
-      if (callbacks) {
-        callbacks.forEach(callback => callback(data));
-      }
-    });
-
-    // Handle historical data
     this.socket.on('historical_data', (data: HistoricalDataResponse) => {
-      const callbacks = this.historicalSubscribers.get(data.symbol);
-      if (callbacks) {
-        callbacks.forEach(callback => callback(data));
-      }
+      this.handleHistoricalData(data);
     });
-
-    return this.socket;
   }
 
   disconnect() {
-    if (this.socket) {
-      this.socket.disconnect();
-      this.socket = null;
-      this.currentSymbol = null;
+    if (!this.socket) return;
+    this.socket.disconnect();
+    this.socket = null;
+    this.subscriptions.clear();
+    this.historicalSubscriptions.clear();
+    this.connectionListeners.clear();
+    this.currentSymbol = null;
+  }
+
+  private notifyConnectionListeners(connected: boolean) {
+    this.connectionListeners.forEach(listener => listener(connected));
+  }
+
+  private handleTick(tick: StockTick) {
+    const symbol = tick.data.symbol;
+    const listeners = this.subscriptions.get(symbol);
+    if (listeners) {
+      listeners.forEach(listener => listener(tick));
+    }
+  }
+
+  private handleHistoricalData(data: HistoricalDataResponse) {
+    const symbol = data.symbol;
+    const listeners = this.historicalSubscriptions.get(symbol);
+    if (listeners) {
+      listeners.forEach(listener => listener(data));
     }
   }
 
   joinSymbol(symbol: string) {
     if (!this.socket?.connected) {
-      console.error('Socket not connected');
+      console.warn('Cannot join symbol: WebSocket not connected');
       return;
     }
 
@@ -122,27 +120,28 @@ class WebSocketService {
     if (this.currentSymbol === symbol) {
       this.currentSymbol = null;
     }
+    this.subscriptions.delete(symbol);
     
     console.log(`📊 Left symbol room: ${symbol}`);
   }
 
   // Subscribe to real-time ticks for a symbol
   subscribeToTicks(symbol: string, callback: (data: StockTick) => void) {
-    if (!this.subscribers.has(symbol)) {
-      this.subscribers.set(symbol, new Set());
+    if (!this.subscriptions.has(symbol)) {
+      this.subscriptions.set(symbol, new Set());
     }
-    this.subscribers.get(symbol)!.add(callback);
+    this.subscriptions.get(symbol)!.add(callback);
 
     // Auto-join the symbol room
     this.joinSymbol(symbol);
 
     // Return unsubscribe function
     return () => {
-      const callbacks = this.subscribers.get(symbol);
+      const callbacks = this.subscriptions.get(symbol);
       if (callbacks) {
         callbacks.delete(callback);
         if (callbacks.size === 0) {
-          this.subscribers.delete(symbol);
+          this.subscriptions.delete(symbol);
           this.leaveSymbol(symbol);
         }
       }
@@ -151,18 +150,18 @@ class WebSocketService {
 
   // Subscribe to historical data for a symbol
   subscribeToHistoricalData(symbol: string, callback: (data: HistoricalDataResponse) => void) {
-    if (!this.historicalSubscribers.has(symbol)) {
-      this.historicalSubscribers.set(symbol, new Set());
+    if (!this.historicalSubscriptions.has(symbol)) {
+      this.historicalSubscriptions.set(symbol, new Set());
     }
-    this.historicalSubscribers.get(symbol)!.add(callback);
+    this.historicalSubscriptions.get(symbol)!.add(callback);
 
     // Return unsubscribe function
     return () => {
-      const callbacks = this.historicalSubscribers.get(symbol);
+      const callbacks = this.historicalSubscriptions.get(symbol);
       if (callbacks) {
         callbacks.delete(callback);
         if (callbacks.size === 0) {
-          this.historicalSubscribers.delete(symbol);
+          this.historicalSubscriptions.delete(symbol);
         }
       }
     };
@@ -170,12 +169,27 @@ class WebSocketService {
 
   // Subscribe to connection status changes
   subscribeToConnection(callback: (connected: boolean) => void) {
-    this.connectionCallbacks.add(callback);
+    this.connectionListeners.add(callback);
+
+    // Immediately notify of current status if socket exists
+    if (this.socket) {
+      callback(this.socket.connected);
+    }
 
     // Return unsubscribe function
     return () => {
-      this.connectionCallbacks.delete(callback);
+      this.connectionListeners.delete(callback);
     };
+  }
+
+  // Request historical data for a symbol
+  requestHistoricalData(symbol: string, period: string = '1D') {
+    if (!this.socket?.connected) {
+      console.warn('Cannot request historical data: WebSocket not connected');
+      return;
+    }
+
+    this.socket.emit('request_historical', { symbol, period });
   }
 
   isConnected(): boolean {

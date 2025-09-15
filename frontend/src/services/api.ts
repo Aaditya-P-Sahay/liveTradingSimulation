@@ -1,137 +1,77 @@
-// src/services/api.ts
+import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
 
-export interface StockData {
-  unique_id: number;
-  timestamp: string;
-  normalized_timestamp?: string;
-  symbol: string;
-  company_name: string;
-  token: number;
-  last_traded_price: number;
-  volume_traded: number;
-  exchange_timestamp: string;
-  open_price: number;
-  high_price: number;
-  low_price: number;
-  close_price: number;
-  total_buy_quantity: string;
-  total_sell_quantity: string;
-  average_traded_price: number;
-  subscription_mode: string;
-}
+// Create axios instance with interceptor
+const api = axios.create({
+  baseURL: API_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
 
-export interface PaginationInfo {
-  page: number;
-  limit: number;
-  totalRecords: number;
-  totalPages: number;
-  hasNext: boolean;
-  hasPrev: boolean;
-}
+// Add auth token to all requests
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('auth_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
 
-export interface HistoryResponse {
-  symbol: string;
-  data: StockData[];
-  pagination: PaginationInfo;
-}
-
-export interface CandlestickData {
-  time: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
-
-export interface CandlestickResponse {
-  symbol: string;
-  interval: string;
-  data: CandlestickData[];
-}
-
-export interface HealthStatus {
-  status: string;
-  connectedUsers: number;
-  activeSymbols: string[];
-  cachedSymbols: string[];
-  uptime: number;
-}
-
-class ApiService {
-  private async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
-    try {
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-        headers: {
-          'Content-Type': 'application/json',
-          ...options?.headers,
-        },
-        ...options,
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error(`API request failed for ${endpoint}:`, error);
-      throw error;
+// Handle auth errors
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('auth_token');
+      window.location.href = '/login';
     }
+    return Promise.reject(error);
   }
+);
 
-  // Get list of available symbols
-  async getSymbols(): Promise<string[]> {
-    return this.request<string[]>('/symbols');
+export const apiService = {
+  // Market Data (Public)
+  async getSymbols() {
+    const { data } = await api.get('/symbols');
+    return data;
+  },
+
+  async getHistory(symbol: string, page = 1, limit = 100) {
+    const { data } = await api.get(`/history/${symbol}?page=${page}&limit=${limit}`);
+    return data;
+  },
+
+  async getCandlestick(symbol: string, interval = '1m') {
+    const { data } = await api.get(`/candlestick/${symbol}?interval=${interval}`);
+    return data;
+  },
+
+  // Trading (Protected)
+  async placeTrade(trade: { symbol: string; order_type: string; quantity: number }) {
+    const { data } = await api.post('/trade', trade);
+    return data;
+  },
+
+  async getPortfolio() {
+    const { data } = await api.get('/portfolio');
+    return data;
+  },
+
+  async getTrades(page = 1, limit = 50) {
+    const { data } = await api.get(`/trades?page=${page}&limit=${limit}`);
+    return data;
+  },
+
+  async getLeaderboard(limit = 100) {
+    const { data } = await api.get(`/leaderboard?limit=${limit}`);
+    return data;
+  },
+
+  // Health check
+  async getHealth() {
+    const { data } = await api.get('/health');
+    return data;
   }
-
-  // Get historical data for a symbol with pagination
-  async getHistory(symbol: string, page: number = 1, limit: number = 1000): Promise<HistoryResponse> {
-    return this.request<HistoryResponse>(`/history/${symbol}?page=${page}&limit=${limit}`);
-  }
-
-  // Get all historical data for a symbol (auto-paginated)
-  async getAllHistory(symbol: string): Promise<StockData[]> {
-    let allData: StockData[] = [];
-    let page = 1;
-    let hasMore = true;
-
-    while (hasMore) {
-      const response = await this.getHistory(symbol, page, 1000);
-      allData = allData.concat(response.data);
-      hasMore = response.pagination.hasNext;
-      page++;
-
-      // Safety break to avoid infinite loops
-      if (page > 100) {
-        console.warn('Stopping pagination at page 100 to avoid infinite loop');
-        break;
-      }
-    }
-
-    return allData;
-  }
-
-  // Get candlestick data for a symbol
-  async getCandlestickData(symbol: string, interval: string = '1m'): Promise<CandlestickResponse> {
-    return this.request<CandlestickResponse>(`/candlestick/${symbol}?interval=${interval}`);
-  }
-
-  // Get server health status
-  async getHealth(): Promise<HealthStatus> {
-    return this.request<HealthStatus>('/health');
-  }
-
-  // Search symbols (client-side filtering)
-  async searchSymbols(query: string): Promise<string[]> {
-    const symbols = await this.getSymbols();
-    return symbols.filter(symbol => 
-      symbol.toLowerCase().includes(query.toLowerCase())
-    );
-  }
-}
-
-// Export singleton instance
-export const apiService = new ApiService();
+};

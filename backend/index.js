@@ -77,17 +77,91 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// In-memory data store for efficient real-time streaming
-const stockDataCache = new Map(); // symbol -> sorted data array
-const activeStreams = new Map(); // symbol -> interval ID
+// ==================== GLOBAL MARKET STATE ====================
+const globalMarketState = {
+  isRunning: false,
+  isPaused: false,
+  startTime: null,
+  currentTickIndex: 0,
+  totalTicks: 0,
+  speed: 2, // 2x speed (500ms per tick)
+  intervalId: null,
+  contestId: null,
+  maxDuration: 60 * 60 * 1000, // 1 hour in milliseconds
+  symbols: [] // Active symbols
+};
+
+// In-memory data store
+const stockDataCache = new Map(); // symbol -> data array
 const connectedUsers = new Set();
 const userSockets = new Map(); // user_email -> socket.id
 const portfolioCache = new Map(); // user_email -> portfolio data
 const leaderboardCache = [];
 
+// ==================== CONTEST STATE PERSISTENCE ====================
+
+// Save contest state to database
+async function saveContestState() {
+  try {
+    if (!globalMarketState.contestId) return;
+
+    const { error } = await supabase
+      .from('contest_state')
+      .upsert({
+        id: globalMarketState.contestId,
+        is_running: globalMarketState.isRunning,
+        is_paused: globalMarketState.isPaused,
+        start_time: globalMarketState.startTime,
+        current_tick_index: globalMarketState.currentTickIndex,
+        total_ticks: globalMarketState.totalTicks,
+        speed: globalMarketState.speed,
+        symbols: globalMarketState.symbols,
+        updated_at: new Date().toISOString()
+      });
+
+    if (error) throw error;
+    console.log('✅ Contest state saved');
+  } catch (error) {
+    console.error('Error saving contest state:', error);
+  }
+}
+
+// Load contest state from database
+async function loadContestState() {
+  try {
+    const { data, error } = await supabase
+      .from('contest_state')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') throw error;
+    
+    if (data && data.is_running && !data.is_paused) {
+      // Resume contest
+      globalMarketState.contestId = data.id;
+      globalMarketState.isRunning = data.is_running;
+      globalMarketState.isPaused = data.is_paused;
+      globalMarketState.startTime = new Date(data.start_time);
+      globalMarketState.currentTickIndex = data.current_tick_index;
+      globalMarketState.totalTicks = data.total_ticks;
+      globalMarketState.speed = data.speed || 2;
+      globalMarketState.symbols = data.symbols || [];
+      
+      console.log(`📊 Resuming contest from tick ${globalMarketState.currentTickIndex}`);
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('Error loading contest state:', error);
+    return false;
+  }
+}
+
 // ==================== AUTHENTICATION MIDDLEWARE ====================
 
-// Middleware to verify Supabase JWT token
 async function authenticateToken(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -194,12 +268,23 @@ function normalizeTimestamp(timestamp) {
   return timestamp;
 }
 
-// Get current market price for a symbol
+// Get current market price for a symbol (uses global tick index)
 function getCurrentPrice(symbol) {
   const data = stockDataCache.get(symbol);
   if (!data || data.length === 0) return null;
   
-  return data[data.length - 1]?.last_traded_price || null;
+  // Use global tick index for synchronized pricing
+  const tickIndex = Math.min(globalMarketState.currentTickIndex, data.length - 1);
+  return data[tickIndex]?.last_traded_price || null;
+}
+
+// Get historical data up to current tick
+function getHistoricalDataUpToTick(symbol, endTick = null) {
+  const data = stockDataCache.get(symbol);
+  if (!data || data.length === 0) return [];
+  
+  const toTick = endTick !== null ? endTick : globalMarketState.currentTickIndex;
+  return data.slice(0, Math.min(toTick + 1, data.length));
 }
 
 // ==================== DATABASE HELPERS ====================
@@ -476,25 +561,6 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
   }
 }
 
-// Get simulation status
-async function getSimulationStatus() {
-  try {
-    const { data, error } = await supabase
-      .from('simulation_control')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error && error.code !== 'PGRST116') throw error;
-    
-    return data || { status: 'active', auto_square_off_triggered: false };
-  } catch (error) {
-    console.error('Error getting simulation status:', error);
-    return { status: 'active', auto_square_off_triggered: false };
-  }
-}
-
 // Auto square off all short positions
 async function autoSquareOffAllShorts() {
   try {
@@ -550,36 +616,114 @@ async function autoSquareOffAllShorts() {
 // Update leaderboard
 async function updateLeaderboard() {
   try {
-    console.log('Skipping leaderboard update - no portfolios exist yet');
-    return [];
+    const { data: portfolios, error } = await supabase
+      .from('portfolio')
+      .select(`
+        user_email,
+        total_wealth,
+        total_pnl,
+        users!portfolio_user_email_fkey("Candidate's Name")
+      `)
+      .order('total_wealth', { ascending: false })
+      .limit(100);
+
+    if (error) throw error;
+
+    if (!portfolios || portfolios.length === 0) {
+      console.log('No portfolios found for leaderboard');
+      return [];
+    }
+
+    const leaderboard = portfolios.map((p, index) => ({
+      rank: index + 1,
+      user_name: p.users?.["Candidate's Name"] || p.user_email,
+      user_email: p.user_email,
+      total_wealth: p.total_wealth,
+      total_pnl: p.total_pnl,
+      return_percentage: ((p.total_wealth - 1000000) / 1000000) * 100
+    }));
+
+    // Update cache
+    leaderboardCache.length = 0;
+    leaderboardCache.push(...leaderboard);
+
+    return leaderboard;
   } catch (error) {
-    console.log('Leaderboard update skipped');
+    console.error('Error updating leaderboard:', error);
     return [];
   }
 }
 
-// ==================== EXISTING MARKET DATA FUNCTIONS ====================
+// Save final contest results
+async function saveContestResults() {
+  try {
+    if (!globalMarketState.contestId) return;
 
-// Load and cache stock data with preprocessing
+    const leaderboard = await updateLeaderboard();
+    
+    // Save contest results
+    const { error } = await supabase
+      .from('contest_results')
+      .insert({
+        contest_id: globalMarketState.contestId,
+        end_time: new Date().toISOString(),
+        final_leaderboard: leaderboard,
+        total_participants: leaderboard.length,
+        winner: leaderboard[0] || null
+      });
+
+    if (error) throw error;
+    
+    console.log('✅ Contest results saved');
+    console.log('🏆 Winner:', leaderboard[0]?.user_name || 'No participants');
+    
+    return leaderboard;
+  } catch (error) {
+    console.error('Error saving contest results:', error);
+    return null;
+  }
+}
+
+// ==================== MARKET DATA FUNCTIONS ====================
+
+// Load and cache stock data - FIXED TO LOAD ALL DATA
 async function loadStockData(symbol) {
   try {
     console.log(`Loading data for ${symbol}...`);
     
-    const { data, error } = await supabase
-      .from('LALAJI')
-      .select('*')
-      .eq('symbol', symbol)
-      .order('unique_id', { ascending: true });
+    // Supabase limits to 1000 rows by default, need to fetch in batches
+    let allData = [];
+    let from = 0;
+    const batchSize = 1000;
+    let hasMore = true;
+    
+    while (hasMore) {
+      const { data, error } = await supabase
+        .from('LALAJI')
+        .select('*')
+        .eq('symbol', symbol)
+        .order('unique_id', { ascending: true })
+        .range(from, from + batchSize - 1);
+      
+      if (error) throw error;
+      
+      if (data && data.length > 0) {
+        allData = allData.concat(data);
+        from += batchSize;
+        hasMore = data.length === batchSize; // If we got full batch, there might be more
+        console.log(`  Loaded batch: ${data.length} rows (total so far: ${allData.length})`);
+      } else {
+        hasMore = false;
+      }
+    }
 
-    if (error) throw error;
-
-    if (!data || data.length === 0) {
+    if (allData.length === 0) {
       console.log(`No data found for ${symbol}`);
       return [];
     }
 
     // Preprocess data: normalize timestamps and ensure proper sorting
-    const processedData = data.map(row => ({
+    const processedData = allData.map(row => ({
       ...row,
       normalized_timestamp: normalizeTimestamp(row.timestamp),
       last_traded_price: parseFloat(row.last_traded_price) || 0,
@@ -592,7 +736,12 @@ async function loadStockData(symbol) {
     })).sort((a, b) => new Date(a.normalized_timestamp) - new Date(b.normalized_timestamp));
 
     stockDataCache.set(symbol, processedData);
-    console.log(`Loaded ${processedData.length} data points for ${symbol}`);
+    console.log(`✅ Loaded ${processedData.length} total data points for ${symbol}`);
+    
+    // Update global total ticks (use minimum across all symbols)
+    if (globalMarketState.totalTicks === 0 || processedData.length < globalMarketState.totalTicks) {
+      globalMarketState.totalTicks = processedData.length;
+    }
     
     return processedData;
   } catch (error) {
@@ -604,10 +753,12 @@ async function loadStockData(symbol) {
 // Get available symbols
 async function getAvailableSymbols() {
   try {
+    // For symbols, we don't need all rows, just unique values
     const { data, error } = await supabase
       .from('LALAJI')
       .select('symbol')
-      .not('symbol', 'is', null);
+      .not('symbol', 'is', null)
+      .limit(1000); // This is fine for getting unique symbols
 
     if (error) throw error;
 
@@ -620,52 +771,159 @@ async function getAvailableSymbols() {
   }
 }
 
-// Start real-time simulation for a symbol
-function startRealTimeSimulation(symbol) {
-  if (activeStreams.has(symbol)) {
-    console.log(`Simulation already running for ${symbol}`);
+// ==================== GLOBAL MARKET SIMULATION ====================
+
+// Start global market simulation
+async function startGlobalMarketSimulation() {
+  if (globalMarketState.isRunning && !globalMarketState.isPaused) {
+    console.log('Market simulation already running');
     return;
   }
 
-  const data = stockDataCache.get(symbol);
-  if (!data || data.length === 0) {
-    console.log(`No data available for simulation: ${symbol}`);
+  // If paused, resume
+  if (globalMarketState.isPaused) {
+    globalMarketState.isPaused = false;
+    console.log('📊 Resuming market simulation');
+    await saveContestState();
     return;
   }
 
-  let currentIndex = 0;
-  const intervalId = setInterval(async () => {
-    if (currentIndex >= data.length) {
-      // Restart simulation from beginning
-      currentIndex = 0;
-    }
-
-    const currentTick = data[currentIndex];
+  // Start new simulation
+  globalMarketState.isRunning = true;
+  globalMarketState.isPaused = false;
+  globalMarketState.startTime = new Date();
+  globalMarketState.currentTickIndex = 0;
+  globalMarketState.contestId = crypto.randomUUID();
+  
+  // Load all symbols
+  const symbols = await getAvailableSymbols();
+  globalMarketState.symbols = symbols;
+  
+  // Preload data for all symbols
+  console.log('📊 Loading market data for all symbols...');
+  for (const symbol of symbols) {
+    await loadStockData(symbol);
+  }
+  
+  console.log(`🚀 Starting global market simulation at ${globalMarketState.speed}x speed`);
+  console.log(`📈 Total ticks: ${globalMarketState.totalTicks}`);
+  console.log(`⏱️  Expected duration: ${(globalMarketState.totalTicks * 500) / 60000} minutes`);
+  
+  // Save initial state
+  await saveContestState();
+  
+  // Start the global ticker
+  globalMarketState.intervalId = setInterval(async () => {
+    if (globalMarketState.isPaused) return;
     
-    // Broadcast to all clients in the symbol room
-    io.to(symbol).emit('tick', {
-      symbol,
-      data: currentTick,
-      timestamp: new Date().toISOString(),
-      index: currentIndex,
-      total: data.length
+    // Check if we've reached 1 hour
+    const elapsedTime = Date.now() - globalMarketState.startTime.getTime();
+    if (elapsedTime >= globalMarketState.maxDuration) {
+      console.log('⏰ Contest duration reached (1 hour). Stopping simulation.');
+      await stopGlobalMarketSimulation();
+      return;
+    }
+    
+    // Check if we've exhausted data
+    if (globalMarketState.currentTickIndex >= globalMarketState.totalTicks) {
+      console.log('📊 All market data exhausted. Stopping simulation.');
+      await stopGlobalMarketSimulation();
+      return;
+    }
+    
+    // Broadcast current tick for all symbols
+    for (const symbol of globalMarketState.symbols) {
+      const data = stockDataCache.get(symbol);
+      if (!data || data.length === 0) continue;
+      
+      const tickIndex = Math.min(globalMarketState.currentTickIndex, data.length - 1);
+      const currentTick = data[tickIndex];
+      
+      if (currentTick) {
+        io.to(symbol).emit('tick', {
+          symbol,
+          data: currentTick,
+          globalTickIndex: globalMarketState.currentTickIndex,
+          totalTicks: globalMarketState.totalTicks,
+          serverTime: new Date().toISOString(),
+          elapsedTime: elapsedTime,
+          progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100
+        });
+      }
+    }
+    
+    // Also broadcast global market state
+    io.emit('market_state', {
+      isRunning: globalMarketState.isRunning,
+      isPaused: globalMarketState.isPaused,
+      currentTickIndex: globalMarketState.currentTickIndex,
+      totalTicks: globalMarketState.totalTicks,
+      elapsedTime: elapsedTime,
+      progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100,
+      speed: globalMarketState.speed
     });
-
-    currentIndex++;
-  }, 1000); // 1 second intervals
-
-  activeStreams.set(symbol, intervalId);
-  console.log(`Started real-time simulation for ${symbol}`);
+    
+    globalMarketState.currentTickIndex++;
+    
+    // Save state every 60 ticks (30 seconds at 2x speed)
+    if (globalMarketState.currentTickIndex % 60 === 0) {
+      await saveContestState();
+    }
+    
+  }, 500); // 500ms = 2x speed (normal would be 1000ms)
 }
 
-// Stop real-time simulation for a symbol
-function stopRealTimeSimulation(symbol) {
-  const intervalId = activeStreams.get(symbol);
-  if (intervalId) {
-    clearInterval(intervalId);
-    activeStreams.delete(symbol);
-    console.log(`Stopped simulation for ${symbol}`);
+// Stop global market simulation
+async function stopGlobalMarketSimulation() {
+  if (!globalMarketState.isRunning) {
+    console.log('Market simulation not running');
+    return;
   }
+  
+  // Clear interval
+  if (globalMarketState.intervalId) {
+    clearInterval(globalMarketState.intervalId);
+    globalMarketState.intervalId = null;
+  }
+  
+  globalMarketState.isRunning = false;
+  globalMarketState.isPaused = false;
+  
+  console.log('🛑 Stopping market simulation');
+  
+  // Auto square off all positions
+  await autoSquareOffAllShorts();
+  
+  // Save final contest results
+  const finalResults = await saveContestResults();
+  
+  // Save final state
+  await saveContestState();
+  
+  // Broadcast stop event
+  io.emit('market_stopped', {
+    finalResults: finalResults,
+    message: 'Market simulation has ended'
+  });
+  
+  console.log('✅ Market simulation stopped and results saved');
+}
+
+// Pause market simulation
+async function pauseGlobalMarketSimulation() {
+  if (!globalMarketState.isRunning) {
+    console.log('Market simulation not running');
+    return;
+  }
+  
+  globalMarketState.isPaused = true;
+  await saveContestState();
+  
+  console.log('⏸️  Market simulation paused');
+  
+  io.emit('market_paused', {
+    message: 'Market simulation has been paused'
+  });
 }
 
 // Group data into candlestick format
@@ -743,13 +1001,147 @@ function getIntervalMs(interval) {
 
 // ==================== REST API ROUTES ====================
 
-// ===== EXISTING MARKET DATA ROUTES =====
+// ==================== AUTH ENDPOINTS ====================
+
+// User Registration
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { email, password, full_name } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+
+    // Create user in Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { full_name }
+      }
+    });
+
+    if (authError) throw authError;
+
+    // Create user in your users table
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .insert({
+        auth_id: authData.user.id,
+        "Candidate's Email": email,
+        "Candidate's Name": full_name || email.split('@')[0],
+        role: 'user',
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (userError) throw userError;
+
+    res.json({
+      success: true,
+      user: userData,
+      token: authData.session?.access_token
+    });
+  } catch (error) {
+    console.error('Signup error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// User Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (error) throw error;
+
+    // Get user details
+    const { data: userData } = await supabase
+      .from('users')
+      .select('*')
+      .eq('auth_id', data.user.id)
+      .single();
+
+    res.json({
+      success: true,
+      user: userData || { email: data.user.email },
+      token: data.session.access_token
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(401).json({ error: 'Invalid credentials' });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      user: req.user
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Logout
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    res.json({ success: true, message: 'Logged out successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== MARKET DATA ROUTES =====
 
 // Get available symbols
 app.get('/api/symbols', async (req, res) => {
   try {
     const symbols = await getAvailableSymbols();
     res.json(symbols);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get historical data range (from start to current tick)
+app.get('/api/history/:symbol/range', async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { from, to } = req.query;
+    
+    let data = stockDataCache.get(symbol);
+    
+    if (!data) {
+      data = await loadStockData(symbol);
+    }
+    
+    // Default: from start to current tick
+    const fromTick = parseInt(from) || 0;
+    const toTick = parseInt(to) || globalMarketState.currentTickIndex;
+    
+    const rangeData = data.slice(fromTick, Math.min(toTick + 1, data.length));
+    
+    res.json({
+      symbol,
+      fromTick,
+      toTick,
+      currentMarketTick: globalMarketState.currentTickIndex,
+      data: rangeData,
+      count: rangeData.length
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -769,13 +1161,16 @@ app.get('/api/history/:symbol', async (req, res) => {
       data = await loadStockData(symbol);
     }
 
-    const totalRecords = data.length;
+    // Only return data up to current tick
+    const availableData = getHistoricalDataUpToTick(symbol);
+    const totalRecords = availableData.length;
     const totalPages = Math.ceil(totalRecords / limit);
-    const paginatedData = data.slice(offset, offset + limit);
+    const paginatedData = availableData.slice(offset, offset + limit);
 
     res.json({
       symbol,
       data: paginatedData,
+      currentMarketTick: globalMarketState.currentTickIndex,
       pagination: {
         page,
         limit,
@@ -794,24 +1189,43 @@ app.get('/api/history/:symbol', async (req, res) => {
 app.get('/api/candlestick/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
-    const interval = req.query.interval || '1m'; // 1m, 5m, 15m, 1h, 1d
+    const interval = req.query.interval || '1m';
     
-    let data = stockDataCache.get(symbol);
-    if (!data) {
-      data = await loadStockData(symbol);
-    }
-
+    // Only use data up to current tick
+    const data = getHistoricalDataUpToTick(symbol);
+    
     // Group data into candlestick intervals
     const candlesticks = groupIntoCandlesticks(data, interval);
     
     res.json({
       symbol,
       interval,
+      currentMarketTick: globalMarketState.currentTickIndex,
       data: candlesticks
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Get current market state
+app.get('/api/market/state', (req, res) => {
+  const elapsedTime = globalMarketState.startTime 
+    ? Date.now() - globalMarketState.startTime.getTime() 
+    : 0;
+    
+  res.json({
+    isRunning: globalMarketState.isRunning,
+    isPaused: globalMarketState.isPaused,
+    startTime: globalMarketState.startTime,
+    currentTickIndex: globalMarketState.currentTickIndex,
+    totalTicks: globalMarketState.totalTicks,
+    elapsedTime,
+    progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100,
+    speed: globalMarketState.speed,
+    symbols: globalMarketState.symbols,
+    contestId: globalMarketState.contestId
+  });
 });
 
 // ===== TRADING API ROUTES =====
@@ -835,13 +1249,12 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Quantity must be positive' });
     }
 
-    // Check simulation status
-    const simStatus = await getSimulationStatus();
-    if (simStatus.status !== 'active') {
-      return res.status(400).json({ error: 'Trading is currently disabled' });
+    // Check if market is running
+    if (!globalMarketState.isRunning || globalMarketState.isPaused) {
+      return res.status(400).json({ error: 'Market is not currently active' });
     }
 
-    // Get current price
+    // Get current price (uses global tick)
     const currentPrice = getCurrentPrice(symbol);
     if (!currentPrice) {
       return res.status(400).json({ error: 'Price not available for symbol' });
@@ -866,7 +1279,11 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       trade: result.trade,
-      portfolio: result.portfolio
+      portfolio: result.portfolio,
+      executedAt: {
+        tickIndex: globalMarketState.currentTickIndex,
+        price: currentPrice
+      }
     });
 
   } catch (error) {
@@ -969,80 +1386,105 @@ app.get('/api/leaderboard', async (req, res) => {
 
 // ===== ADMIN ROUTES =====
 
-// Start simulation
-app.post('/api/admin/simulation/start', authenticateToken, requireAdmin, async (req, res) => {
+// Start contest/simulation
+app.post('/api/admin/contest/start', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { data: simulation, error } = await supabase
-      .from('simulation_control')
-      .insert({
-        status: 'active',
-        start_time: new Date().toISOString(),
-        auto_square_off_triggered: false
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    // Broadcast simulation status update
-    io.emit('simulation_status', simulation);
-
-    res.json({ success: true, simulation });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Stop simulation
-app.post('/api/admin/simulation/stop', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const currentStatus = await getSimulationStatus();
+    await startGlobalMarketSimulation();
     
-    const { data: simulation, error } = await supabase
-      .from('simulation_control')
-      .update({
-        status: 'stopped',
-        end_time: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', currentStatus.id)
-      .select()
-      .single();
+    res.json({ 
+      success: true, 
+      message: 'Contest started',
+      contestId: globalMarketState.contestId,
+      expectedDuration: `${(globalMarketState.totalTicks * 500) / 60000} minutes at ${globalMarketState.speed}x speed`
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
+// Stop contest/simulation
+app.post('/api/admin/contest/stop', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await stopGlobalMarketSimulation();
+    
+    res.json({ 
+      success: true, 
+      message: 'Contest stopped and results saved',
+      finalLeaderboard: leaderboardCache.slice(0, 10)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Pause contest
+app.post('/api/admin/contest/pause', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await pauseGlobalMarketSimulation();
+    
+    res.json({ 
+      success: true, 
+      message: 'Contest paused'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Resume contest
+app.post('/api/admin/contest/resume', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await startGlobalMarketSimulation(); // Will resume if paused
+    
+    res.json({ 
+      success: true, 
+      message: 'Contest resumed'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get contest status
+app.get('/api/admin/contest/status', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const elapsedTime = globalMarketState.startTime 
+      ? Date.now() - globalMarketState.startTime.getTime() 
+      : 0;
+      
+    res.json({
+      ...globalMarketState,
+      elapsedTime,
+      remainingTime: Math.max(0, globalMarketState.maxDuration - elapsedTime),
+      progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get past contest results
+app.get('/api/admin/contest/results/:contestId?', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { contestId } = req.params;
+    
+    let query = supabase.from('contest_results').select('*');
+    
+    if (contestId) {
+      query = query.eq('contest_id', contestId).single();
+    } else {
+      query = query.order('end_time', { ascending: false }).limit(10);
+    }
+    
+    const { data, error } = await query;
+    
     if (error) throw error;
-
-    // Trigger auto square off
-    await autoSquareOffAllShorts();
-
-    // Broadcast simulation status update
-    io.emit('simulation_status', simulation);
-
-    res.json({ success: true, simulation });
+    
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
-
-// Get simulation status
-app.get('/api/admin/simulation/status', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const status = await getSimulationStatus();
-    res.json(status);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Manual auto square off
-app.post('/api/admin/simulation/square-off', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    await autoSquareOffAllShorts();
-    res.json({ success: true, message: 'Auto square-off completed' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -1051,25 +1493,50 @@ app.get('/api/health', (req, res) => {
   
   res.json({
     status: 'healthy',
-    connectedUsers: totalConnections,
-    authenticatedUsers: authenticatedUsers,
-    guestUsers: totalConnections - authenticatedUsers,
-    activeSymbols: Array.from(activeStreams.keys()),
-    cachedSymbols: Array.from(stockDataCache.keys()),
-    cachedPortfolios: portfolioCache.size,
+    marketState: {
+      isRunning: globalMarketState.isRunning,
+      isPaused: globalMarketState.isPaused,
+      currentTick: globalMarketState.currentTickIndex,
+      totalTicks: globalMarketState.totalTicks,
+      progress: `${((globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100).toFixed(2)}%`
+    },
+    connections: {
+      total: totalConnections,
+      authenticated: authenticatedUsers,
+      guests: totalConnections - authenticatedUsers
+    },
+    cache: {
+      symbols: Array.from(stockDataCache.keys()),
+      portfolios: portfolioCache.size,
+      leaderboardSize: leaderboardCache.length
+    },
     uptime: process.uptime()
   });
 });
 
-
 // ==================== WEBSOCKET CONNECTION HANDLING ====================
 
 io.on('connection', async (socket) => {
-  console.log(`User connected: ${socket.id} (unauthenticated - market data only)`);
+  console.log(`User connected: ${socket.id}`);
   
   connectedUsers.add(socket.id);
+  
+  // Send current market state immediately
+  const elapsedTime = globalMarketState.startTime 
+    ? Date.now() - globalMarketState.startTime.getTime() 
+    : 0;
+    
+  socket.emit('market_state', {
+    isRunning: globalMarketState.isRunning,
+    isPaused: globalMarketState.isPaused,
+    currentTickIndex: globalMarketState.currentTickIndex,
+    totalTicks: globalMarketState.totalTicks,
+    elapsedTime,
+    progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100,
+    speed: globalMarketState.speed
+  });
 
-  // Join symbol room for market data (available to all users)
+  // Join symbol room for market data
   socket.on('join_symbol', async (symbol) => {
     console.log(`${socket.id} joining room: ${symbol}`);
     
@@ -1085,17 +1552,13 @@ io.on('connection', async (socket) => {
       await loadStockData(symbol);
     }
 
-    // Start simulation if not already running
-    if (!activeStreams.has(symbol)) {
-      startRealTimeSimulation(symbol);
-    }
-
-    // Send initial data
-    const historicalData = stockDataCache.get(symbol) || [];
+    // Send historical data up to current tick
+    const historicalData = getHistoricalDataUpToTick(symbol);
     socket.emit('historical_data', {
       symbol,
-      data: historicalData.slice(-100),
-      total: historicalData.length
+      data: historicalData.slice(-100), // Last 100 points
+      total: historicalData.length,
+      currentMarketTick: globalMarketState.currentTickIndex
     });
   });
 
@@ -1103,39 +1566,23 @@ io.on('connection', async (socket) => {
   socket.on('leave_symbol', (symbol) => {
     console.log(`${socket.id} leaving room: ${symbol}`);
     socket.leave(symbol);
-    
-    // Check if room is empty, stop simulation if so
-    const room = io.sockets.adapter.rooms.get(symbol);
-    if (!room || room.size === 0) {
-      stopRealTimeSimulation(symbol);
-    }
   });
 
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     connectedUsers.delete(socket.id);
-    
-    // Clean up empty rooms
-    activeStreams.forEach((intervalId, symbol) => {
-      const room = io.sockets.adapter.rooms.get(symbol);
-      if (!room || room.size === 0) {
-        stopRealTimeSimulation(symbol);
-      }
-    });
   });
 });
 
 // ==================== STARTUP & SHUTDOWN ====================
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
   
-  // Stop all simulations
-  activeStreams.forEach((intervalId) => {
-    clearInterval(intervalId);
-  });
+  // Stop market simulation
+  await stopGlobalMarketSimulation();
   
   server.close(() => {
     console.log('Server closed.');
@@ -1145,30 +1592,21 @@ process.on('SIGTERM', () => {
 
 // Start server
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 Trading Simulation Server running on port ${PORT}`);
+server.listen(PORT, async () => {
+  console.log(`🚀 Trading Contest Server running on port ${PORT}`);
   console.log(`📊 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🔌 API endpoint: http://localhost:${PORT}/api`);
-});
-
-// Initialize leaderboard and preload popular symbols on startup
-const popularSymbols = ['ADANIENT', 'INFY', 'INDIGO', 'TCS', 'RELIANCE'];
-setTimeout(async () => {
-  console.log('Initializing system...');
   
-  // Preload popular symbols
-  console.log('Preloading popular symbols...');
-  for (const symbol of popularSymbols) {
-    try {
-      await loadStockData(symbol);
-    } catch (error) {
-      console.error(`Failed to preload ${symbol}:`, error.message);
-    }
+  // Check if we should resume a previous contest
+  const resumed = await loadContestState();
+  if (resumed) {
+    console.log('📊 Found previous contest state, resuming...');
+    await startGlobalMarketSimulation();
+  } else {
+    console.log('⏸️  No active contest. Start one using admin API.');
   }
   
-  // Initialize leaderboard (may fail if no data exists yet)
-  console.log('Initializing leaderboard...');
+  // Initialize leaderboard
   await updateLeaderboard();
-  
   console.log('✅ System initialization complete');
-}, 1000);
+});
