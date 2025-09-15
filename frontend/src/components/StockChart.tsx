@@ -1,417 +1,319 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { StockData } from '../services/api';
-import { TrendingUp, TrendingDown, Radio } from 'lucide-react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { createChart, IChartApi, ISeriesApi, Time } from 'lightweight-charts';
+import { useMarket } from '../../contexts/MarketContext';
+import { socket } from '../../lib/socket';
+import axios from 'axios';
 
-interface StockChartProps {
-  data: StockData[];
+const API_URL = import.meta.env.VITE_API_URL;
+
+interface LiveStockChartProps {
   symbol: string;
-  isRealTime?: boolean;
-  realtimeCount?: number;
+  chartType: 'line' | 'candlestick';
 }
 
-export const StockChart: React.FC<StockChartProps> = ({ 
-  data, 
-  symbol, 
-  isRealTime = false, 
-  realtimeCount = 0 
-}) => {
-  const [chartType, setChartType] = useState<'line' | 'candlestick'>('line');
-  const [timeRange, setTimeRange] = useState<'all' | '1h' | '6h' | '1d'>('all');
-  const animationRef = useRef<number>();
+export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartType }) => {
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<'Line' | 'Candlestick'> | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isConnected, setIsConnected] = useState(false);
+  const { marketState } = useMarket();
+  
+  // Store raw data and candles
+  const rawDataRef = useRef<any[]>([]);
+  const candlesRef = useRef<Map<number, any>>(new Map());
+  const lastProcessedTick = useRef<number>(-1);
+  const currentCandleRef = useRef<any>(null);
 
-  if (!data.length) return null;
+  // Parse timestamp
+  const parseTimestamp = (timestamp: string): number => {
+    const date = new Date(timestamp);
+    return Math.floor(date.getTime() / 1000);
+  };
 
-  // Filter data based on time range
-  const getFilteredData = () => {
-    if (timeRange === 'all') return data;
-    
-    const now = new Date();
-    const ranges = {
-      '1h': 60 * 60 * 1000,
-      '6h': 6 * 60 * 60 * 1000,
-      '1d': 24 * 60 * 60 * 1000
-    };
-    
-    const rangeMs = ranges[timeRange];
-    const cutoff = new Date(now.getTime() - rangeMs);
-    
-    return data.filter(item => {
-      const itemTime = new Date(item.normalized_timestamp || item.timestamp);
-      return itemTime >= cutoff;
+  // Create 30-second candles from raw data
+  const create30SecondCandles = useCallback((data: any[]) => {
+    const candles: any[] = [];
+    let currentCandle: any = null;
+    const interval = 30; // 30 seconds
+
+    data.forEach((tick) => {
+      const time = parseTimestamp(tick.timestamp || tick.normalized_timestamp);
+      const candleTime = Math.floor(time / interval) * interval;
+
+      if (!currentCandle || currentCandle.time !== candleTime) {
+        if (currentCandle) {
+          candles.push(currentCandle);
+        }
+        currentCandle = {
+          time: candleTime as Time,
+          open: tick.last_traded_price,
+          high: tick.last_traded_price,
+          low: tick.last_traded_price,
+          close: tick.last_traded_price,
+        };
+      } else {
+        currentCandle.high = Math.max(currentCandle.high, tick.last_traded_price);
+        currentCandle.low = Math.min(currentCandle.low, tick.last_traded_price);
+        currentCandle.close = tick.last_traded_price;
+      }
     });
-  };
 
-  // Sort data by unique_id to get chronological order
-  const sortedData = getFilteredData().sort((a, b) => a.unique_id - b.unique_id);
-  
-  // Get price range for scaling with some padding
-  const prices = sortedData.map(d => d.last_traded_price);
-  const minPrice = Math.min(...prices);
-  const maxPrice = Math.max(...prices);
-  const priceRange = maxPrice - minPrice;
-  const padding = priceRange * 0.1; // 10% padding
-  const chartMinPrice = minPrice - padding;
-  const chartMaxPrice = maxPrice + padding;
-  const chartPriceRange = chartMaxPrice - chartMinPrice;
-  
-  // Chart dimensions
-  const width = 1000;
-  const height = 400;
-  const chartPadding = { top: 20, right: 80, bottom: 60, left: 80 };
-  const chartWidth = width - chartPadding.left - chartPadding.right;
-  const chartHeight = height - chartPadding.top - chartPadding.bottom;
-  
-  // Create SVG path for price line
-  const createPath = (data: StockData[]) => {
-    return data.map((point, index) => {
-      const x = chartPadding.left + (index / Math.max(1, data.length - 1)) * chartWidth;
-      const y = chartPadding.top + (1 - (point.last_traded_price - chartMinPrice) / chartPriceRange) * chartHeight;
-      return `${index === 0 ? 'M' : 'L'} ${x} ${y}`;
-    }).join(' ');
-  };
-
-  // Create area fill path
-  const createAreaPath = (data: StockData[]) => {
-    if (data.length === 0) return '';
-    
-    const linePath = data.map((point, index) => {
-      const x = chartPadding.left + (index / Math.max(1, data.length - 1)) * chartWidth;
-      const y = chartPadding.top + (1 - (point.last_traded_price - chartMinPrice) / chartPriceRange) * chartHeight;
-      return `${index === 0 ? 'M' : 'L'} ${x} ${y}`;
-    }).join(' ');
-    
-    const lastX = chartPadding.left + chartWidth;
-    const firstX = chartPadding.left;
-    const bottomY = chartPadding.top + chartHeight;
-    
-    return `${linePath} L ${lastX} ${bottomY} L ${firstX} ${bottomY} Z`;
-  };
-
-  const pathData = createPath(sortedData);
-  const areaPathData = createAreaPath(sortedData);
-  const latestPrice = sortedData[sortedData.length - 1]?.last_traded_price || 0;
-  const firstPrice = sortedData[0]?.last_traded_price || 0;
-  const priceChange = latestPrice - firstPrice;
-  const priceChangePercent = firstPrice > 0 ? ((priceChange / firstPrice) * 100).toFixed(2) : '0.00';
-  const isPositive = priceChange >= 0;
-
-  // Generate Y-axis labels
-  const yAxisLabels = [];
-  const labelCount = 8;
-  for (let i = 0; i < labelCount; i++) {
-    const value = chartMinPrice + (chartPriceRange * i) / (labelCount - 1);
-    const y = chartPadding.top + (1 - i / (labelCount - 1)) * chartHeight;
-    yAxisLabels.push({ value, y });
-  }
-
-  // Generate X-axis labels
-  const xAxisLabels = [];
-  const xLabelStep = Math.max(1, Math.floor(sortedData.length / 8));
-  for (let i = 0; i < sortedData.length; i += xLabelStep) {
-    const point = sortedData[i];
-    const x = chartPadding.left + (i / Math.max(1, sortedData.length - 1)) * chartWidth;
-    
-    // Format timestamp for display
-    let displayTime = point.timestamp || `${i + 1}`;
-    if (point.normalized_timestamp) {
-      const date = new Date(point.normalized_timestamp);
-      displayTime = date.toLocaleTimeString('en-US', { 
-        hour: '2-digit', 
-        minute: '2-digit',
-        hour12: false 
-      });
+    if (currentCandle) {
+      candles.push(currentCandle);
     }
-    
-    xAxisLabels.push({ 
-      x, 
-      label: displayTime,
-      index: i
-    });
-  }
 
-  // Candlestick data generation (simplified)
-  const generateCandlesticks = () => {
-    const candles = [];
-    const groupSize = Math.max(1, Math.floor(sortedData.length / 50)); // Group data points
-    
-    for (let i = 0; i < sortedData.length; i += groupSize) {
-      const group = sortedData.slice(i, i + groupSize);
-      if (group.length === 0) continue;
-      
-      const open = group[0].last_traded_price;
-      const close = group[group.length - 1].last_traded_price;
-      const high = Math.max(...group.map(d => d.high_price));
-      const low = Math.min(...group.map(d => d.low_price));
-      
-      const x = chartPadding.left + ((i + groupSize / 2) / Math.max(1, sortedData.length - 1)) * chartWidth;
-      const openY = chartPadding.top + (1 - (open - chartMinPrice) / chartPriceRange) * chartHeight;
-      const closeY = chartPadding.top + (1 - (close - chartMinPrice) / chartPriceRange) * chartHeight;
-      const highY = chartPadding.top + (1 - (high - chartMinPrice) / chartPriceRange) * chartHeight;
-      const lowY = chartPadding.top + (1 - (low - chartMinPrice) / chartPriceRange) * chartHeight;
-      
-      candles.push({
-        x, openY, closeY, highY, lowY,
-        open, close, high, low,
-        isGreen: close >= open,
-        group
-      });
-    }
-    
     return candles;
-  };
+  }, []);
 
-  const candlesticks = chartType === 'candlestick' ? generateCandlesticks() : [];
+  // Update chart with new data
+  const updateChartData = useCallback(() => {
+    if (!seriesRef.current || !rawDataRef.current.length) return;
+
+    if (chartType === 'candlestick') {
+      const candles = create30SecondCandles(rawDataRef.current);
+      seriesRef.current.setData(candles);
+    } else {
+      const lineData = rawDataRef.current.map((d: any) => ({
+        time: parseTimestamp(d.timestamp || d.normalized_timestamp) as Time,
+        value: d.last_traded_price,
+      }));
+      seriesRef.current.setData(lineData);
+    }
+  }, [chartType, create30SecondCandles]);
+
+  // Initialize chart
+  useEffect(() => {
+    if (!chartContainerRef.current) return;
+
+    // Clean up existing chart
+    if (chartRef.current) {
+      chartRef.current.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+    }
+
+    const chart = createChart(chartContainerRef.current, {
+      width: chartContainerRef.current.clientWidth,
+      height: 400,
+      layout: {
+        background: { color: '#1a1a1a' },
+        textColor: '#d1d4dc',
+      },
+      grid: {
+        vertLines: { color: '#2a2a2a' },
+        horzLines: { color: '#2a2a2a' },
+      },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+      },
+    });
+
+    chartRef.current = chart;
+
+    // Create series based on chart type
+    if (chartType === 'line') {
+      const lineSeries = chart.addLineSeries({
+        color: '#2962FF',
+        lineWidth: 2,
+      });
+      seriesRef.current = lineSeries as any;
+    } else {
+      const candlestickSeries = chart.addCandlestickSeries({
+        upColor: '#10b981',
+        downColor: '#ef4444',
+        borderUpColor: '#10b981',
+        borderDownColor: '#ef4444',
+        wickUpColor: '#10b981',
+        wickDownColor: '#ef4444',
+      });
+      seriesRef.current = candlestickSeries as any;
+    }
+
+    const handleResize = () => {
+      if (chartContainerRef.current) {
+        chart.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+        });
+      }
+    };
+    window.addEventListener('resize', handleResize);
+
+    // Update chart with existing data if we have any
+    if (rawDataRef.current.length > 0) {
+      updateChartData();
+    }
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      chart.remove();
+    };
+  }, [chartType, updateChartData]);
+
+  // Load initial data and set up WebSocket listeners
+  useEffect(() => {
+    if (!symbol) return;
+
+    let mounted = true;
+
+    const loadInitialData = async () => {
+      try {
+        setLoading(true);
+        
+        // Get historical data up to current tick
+        const { data } = await axios.get(
+          `${API_URL}/history/${symbol}/range?from=0&to=${marketState.currentTickIndex || 0}`
+        );
+        
+        if (data.data && data.data.length > 0 && mounted) {
+          rawDataRef.current = data.data;
+          lastProcessedTick.current = marketState.currentTickIndex || 0;
+          updateChartData();
+        }
+      } catch (error) {
+        console.error('Failed to load initial data:', error);
+      } finally {
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    // Socket event handlers
+    const handleConnect = () => {
+      console.log('✅ Connected to market');
+      setIsConnected(true);
+      socket.emit('join_symbol', symbol);
+    };
+
+    const handleDisconnect = () => {
+      console.log('❌ Disconnected from market');
+      setIsConnected(false);
+    };
+
+    const handleHistoricalData = (data: any) => {
+      if (data.symbol === symbol && data.data && mounted) {
+        console.log(`Received historical data for ${symbol}: ${data.data.length} points`);
+        rawDataRef.current = data.data;
+        lastProcessedTick.current = data.currentMarketTick || 0;
+        updateChartData();
+      }
+    };
+
+    const handleSymbolTick = (data: any) => {
+      if (data.symbol === symbol && data.data && mounted) {
+        // Add new tick to raw data
+        rawDataRef.current.push(data.data);
+        lastProcessedTick.current = data.tickIndex;
+        
+        // Update chart immediately
+        updateChartData();
+        
+        console.log(`New tick for ${symbol} at index ${data.tickIndex}: $${data.data.last_traded_price}`);
+      }
+    };
+
+    const handleMarketTick = (data: any) => {
+      if (mounted && data.prices && data.prices[symbol]) {
+        // Update last price if we have it
+        const lastItem = rawDataRef.current[rawDataRef.current.length - 1];
+        if (lastItem) {
+          lastItem.last_traded_price = data.prices[symbol];
+          updateChartData();
+        }
+      }
+    };
+
+    // Load initial data
+    loadInitialData();
+
+    // Set up socket listeners
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
+    socket.on('historical_data', handleHistoricalData);
+    socket.on('symbol_tick', handleSymbolTick);
+    socket.on('market_tick', handleMarketTick);
+
+    // Check connection status
+    if (socket.connected) {
+      handleConnect();
+    }
+
+    return () => {
+      mounted = false;
+      socket.emit('leave_symbol', symbol);
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+      socket.off('historical_data', handleHistoricalData);
+      socket.off('symbol_tick', handleSymbolTick);
+      socket.off('market_tick', handleMarketTick);
+    };
+  }, [symbol, marketState.currentTickIndex, updateChartData]);
 
   return (
-    <div className="bg-white rounded-lg shadow-lg p-6">
-      {/* Header */}
+    <div className="bg-gray-900 rounded-lg p-4">
       <div className="flex justify-between items-center mb-4">
-        <div className="flex items-center space-x-4">
-          <div>
-            <h3 className="text-2xl font-bold text-gray-800">{symbol}</h3>
-            <p className="text-sm text-gray-600">{sortedData[0]?.company_name}</p>
-            <p className="text-xs text-gray-500 mt-1">
-              {sortedData.length} data points
-              {isRealTime && (
-                <span className="inline-flex items-center ml-2">
-                  <Radio className="w-3 h-3 text-green-500 mr-1" />
-                  Live ({realtimeCount} updates)
-                </span>
-              )}
-            </p>
+        <div className="flex items-center gap-4">
+          <h3 className="text-lg font-semibold text-white">
+            {symbol} - {chartType === 'line' ? 'Line Chart' : 'Candlestick Chart'}
+          </h3>
+          <div className="flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${
+              isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'
+            }`} />
+            <span className="text-xs text-gray-400">
+              {isConnected ? 'Connected' : 'Disconnected'}
+            </span>
           </div>
-          <div className="text-right">
-            <p className="text-3xl font-bold text-gray-800">₹{latestPrice.toFixed(2)}</p>
-            <p className={`text-lg font-semibold flex items-center justify-end ${isPositive ? 'text-green-600' : 'text-red-600'}`}>
-              {isPositive ? <TrendingUp className="w-4 h-4 mr-1" /> : <TrendingDown className="w-4 h-4 mr-1" />}
-              {priceChange >= 0 ? '+' : ''}{priceChange.toFixed(2)} ({priceChangePercent}%)
-            </p>
-            <p className="text-xs text-gray-500">vs session start</p>
-          </div>
-        </div>
-        
-        {/* Chart Controls */}
-        <div className="flex flex-col space-y-2">
-          <div className="flex space-x-1">
-            {['line', 'candlestick'].map((type) => (
-              <button
-                key={type}
-                onClick={() => setChartType(type as 'line' | 'candlestick')}
-                className={`px-3 py-1 text-xs rounded ${
-                  chartType === type
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                }`}
-              >
-                {type === 'candlestick' ? 'Candles' : 'Line'}
-              </button>
-            ))}
-          </div>
-          <div className="flex space-x-1">
-            {(['all', '1h', '6h', '1d'] as const).map((range) => (
-              <button
-                key={range}
-                onClick={() => setTimeRange(range)}
-                className={`px-2 py-1 text-xs rounded ${
-                  timeRange === range
-                    ? 'bg-green-600 text-white'
-                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                }`}
-              >
-                {range.toUpperCase()}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-      
-      {/* Chart */}
-      <div className="mb-6 overflow-x-auto">
-        <svg width={width} height={height} className="border rounded-lg bg-gray-50">
-          <defs>
-            <linearGradient id={`gradient-${symbol}`} x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor={isPositive ? "#10b981" : "#ef4444"} stopOpacity="0.3"/>
-              <stop offset="100%" stopColor={isPositive ? "#10b981" : "#ef4444"} stopOpacity="0.05"/>
-            </linearGradient>
-          </defs>
           
-          {/* Grid lines */}
-          {yAxisLabels.map((label, index) => (
-            <line
-              key={`hgrid-${index}`}
-              x1={chartPadding.left}
-              y1={label.y}
-              x2={chartPadding.left + chartWidth}
-              y2={label.y}
-              stroke="#e5e7eb"
-              strokeWidth="1"
-              strokeDasharray="2,2"
-            />
-          ))}
-          
-          {xAxisLabels.map((label, index) => (
-            <line
-              key={`vgrid-${index}`}
-              x1={label.x}
-              y1={chartPadding.top}
-              x2={label.x}
-              y2={chartPadding.top + chartHeight}
-              stroke="#e5e7eb"
-              strokeWidth="1"
-              strokeDasharray="2,2"
-            />
-          ))}
-          
-          {/* Chart Content */}
-          {chartType === 'line' ? (
+          {marketState.isRunning && (
             <>
-              {/* Area fill */}
-              <path
-                d={areaPathData}
-                fill={`url(#gradient-${symbol})`}
-              />
-              
-              {/* Price line */}
-              <path
-                d={pathData}
-                fill="none"
-                stroke={isPositive ? "#10b981" : "#ef4444"}
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
+              <span className="text-xs text-blue-400">
+                {marketState.isPaused ? '⏸️ Paused' : '▶️ Live'} @ {marketState.speed}x
+              </span>
+              <span className="text-xs text-gray-500">
+                Tick: {marketState.currentTickIndex}/{marketState.totalTicks}
+              </span>
             </>
-          ) : (
-            /* Candlestick chart */
-            candlesticks.map((candle, index) => (
-              <g key={`candle-${index}`}>
-                {/* High-Low line */}
-                <line
-                  x1={candle.x}
-                  y1={candle.highY}
-                  x2={candle.x}
-                  y2={candle.lowY}
-                  stroke={candle.isGreen ? "#10b981" : "#ef4444"}
-                  strokeWidth="1"
-                />
-                
-                {/* Candle body */}
-                <rect
-                  x={candle.x - 3}
-                  y={Math.min(candle.openY, candle.closeY)}
-                  width="6"
-                  height={Math.abs(candle.closeY - candle.openY) || 1}
-                  fill={candle.isGreen ? "#10b981" : "#ef4444"}
-                  stroke={candle.isGreen ? "#10b981" : "#ef4444"}
-                  strokeWidth="1"
-                >
-                  <title>
-                    Open: ₹{candle.open.toFixed(2)}
-                    High: ₹{candle.high.toFixed(2)}
-                    Low: ₹{candle.low.toFixed(2)}
-                    Close: ₹{candle.close.toFixed(2)}
-                  </title>
-                </rect>
-              </g>
-            ))
           )}
-          
-          {/* Data points for line chart */}
-          {chartType === 'line' && sortedData.filter((_, index) => index % Math.max(1, Math.floor(sortedData.length / 50)) === 0).map((point, index) => {
-            const actualIndex = sortedData.indexOf(point);
-            const x = chartPadding.left + (actualIndex / Math.max(1, sortedData.length - 1)) * chartWidth;
-            const y = chartPadding.top + (1 - (point.last_traded_price - chartMinPrice) / chartPriceRange) * chartHeight;
-            return (
-              <circle
-                key={point.unique_id}
-                cx={x}
-                cy={y}
-                r="3"
-                fill={isPositive ? "#10b981" : "#ef4444"}
-                stroke="white"
-                strokeWidth="2"
-                className="hover:r-6 transition-all cursor-pointer"
-              >
-                <title>
-                  {`₹${point.last_traded_price.toFixed(2)} at ${point.timestamp}
-Volume: ${point.volume_traded.toLocaleString()}
-High: ₹${point.high_price.toFixed(2)}
-Low: ₹${point.low_price.toFixed(2)}`}
-                </title>
-              </circle>
-            );
-          })}
-          
-          {/* Y-axis labels */}
-          {yAxisLabels.map((label, index) => (
-            <text
-              key={`ylabel-${index}`}
-              x={chartPadding.left - 10}
-              y={label.y + 4}
-              fontSize="11"
-              fill="#6b7280"
-              textAnchor="end"
-              fontFamily="monospace"
-            >
-              ₹{label.value.toFixed(0)}
-            </text>
-          ))}
-          
-          {/* X-axis labels */}
-          {xAxisLabels.map((label, index) => (
-            <text
-              key={`xlabel-${index}`}
-              x={label.x}
-              y={chartPadding.top + chartHeight + 20}
-              fontSize="10"
-              fill="#6b7280"
-              textAnchor="middle"
-              transform={`rotate(-45, ${label.x}, ${chartPadding.top + chartHeight + 20})`}
-            >
-              {label.label}
-            </text>
-          ))}
-          
-          {/* Chart border */}
-          <rect
-            x={chartPadding.left}
-            y={chartPadding.top}
-            width={chartWidth}
-            height={chartHeight}
-            fill="none"
-            stroke="#d1d5db"
-            strokeWidth="1"
-          />
-        </svg>
+        </div>
       </div>
+
+      {marketState.isRunning && (
+        <div className="mb-4">
+          <div className="w-full bg-gray-800 rounded-full h-2">
+            <div 
+              className="bg-blue-600 h-2 rounded-full transition-all duration-500 ease-out"
+              style={{ width: `${marketState.progress || 0}%` }}
+            />
+          </div>
+          <div className="flex justify-between mt-1">
+            <span className="text-xs text-gray-400">
+              Progress: {(marketState.progress || 0).toFixed(1)}%
+            </span>
+            <span className="text-xs text-gray-400">
+              Elapsed: {Math.floor((marketState.elapsedTime || 0) / 60000)}m
+            </span>
+          </div>
+        </div>
+      )}
+
+      {loading && (
+        <div className="flex justify-center items-center h-[400px]">
+          <div className="text-gray-400">Loading chart data...</div>
+        </div>
+      )}
       
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
-        <div className="bg-gray-50 p-3 rounded-lg">
-          <p className="text-gray-600 text-xs uppercase tracking-wide">Volume</p>
-          <p className="font-bold text-lg">{latestPrice ? sortedData[sortedData.length - 1]?.volume_traded.toLocaleString() : 0}</p>
+      <div ref={chartContainerRef} style={{ display: loading ? 'none' : 'block' }} />
+      
+      {!marketState.isRunning && !loading && (
+        <div className="mt-4 p-4 bg-yellow-900/20 border border-yellow-700 rounded-lg">
+          <p className="text-yellow-400 text-sm">
+            ⚠️ Market is not running. Use admin controls to start the contest.
+          </p>
         </div>
-        <div className="bg-gray-50 p-3 rounded-lg">
-          <p className="text-gray-600 text-xs uppercase tracking-wide">High</p>
-          <p className="font-bold text-lg text-green-600">₹{Math.max(...sortedData.map(d => d.high_price)).toFixed(2)}</p>
-        </div>
-        <div className="bg-gray-50 p-3 rounded-lg">
-          <p className="text-gray-600 text-xs uppercase tracking-wide">Low</p>
-          <p className="font-bold text-lg text-red-600">₹{Math.min(...sortedData.map(d => d.low_price)).toFixed(2)}</p>
-        </div>
-        <div className="bg-gray-50 p-3 rounded-lg">
-          <p className="text-gray-600 text-xs uppercase tracking-wide">Avg Price</p>
-          <p className="font-bold text-lg">₹{latestPrice ? sortedData[sortedData.length - 1]?.average_traded_price.toFixed(2) : 0}</p>
-        </div>
-        <div className="bg-gray-50 p-3 rounded-lg">
-          <p className="text-gray-600 text-xs uppercase tracking-wide">Data Points</p>
-          <p className="font-bold text-lg text-blue-600">{sortedData.length}</p>
-        </div>
-        <div className="bg-gray-50 p-3 rounded-lg">
-          <p className="text-gray-600 text-xs uppercase tracking-wide">Range</p>
-          <p className="font-bold text-lg text-purple-600">{timeRange.toUpperCase()}</p>
-        </div>
-      </div>
+      )}
     </div>
   );
 };
