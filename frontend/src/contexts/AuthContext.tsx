@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL;
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
 
 interface User {
   email: string;
@@ -43,12 +43,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       
       if (data.success) {
         setUser({
-          email: data.user["Candidate's Email"],
-          name: data.user["Candidate's Name"],
+          email: data.user.email,
+          name: data.user.name,
           role: data.user.role
         });
       }
     } catch (error) {
+      console.error('Auth check failed:', error);
       localStorage.removeItem('auth_token');
       setToken(null);
     } finally {
@@ -63,9 +64,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       localStorage.setItem('auth_token', data.token);
       setToken(data.token);
       setUser({
-        email: data.user?.["Candidate's Email"] || email,
-        name: data.user?.["Candidate's Name"],
-        role: data.user?.role
+        email: data.user.email,
+        name: data.user.name,
+        role: data.user.role
       });
     }
   };

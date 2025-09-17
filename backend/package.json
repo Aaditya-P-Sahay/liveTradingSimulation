@@ -1,7 +1,7 @@
 {
   "name": "trading-simulation-backend",
   "version": "1.0.0",
-  "description": "Stock Market Trading Simulation Backend with WebSocket support",
+  "description": "Stock Market Trading Contest Backend with WebSocket support",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -13,10 +13,12 @@
   "keywords": [
     "stock",
     "trading",
+    "contest",
     "simulation",
     "websocket",
     "real-time",
-    "supabase"
+    "supabase",
+    "short-selling"
   ],
   "author": "Your Name",
   "license": "MIT",

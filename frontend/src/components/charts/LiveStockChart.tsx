@@ -1,10 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, Time } from 'lightweight-charts';
 import { useMarket } from '../../contexts/MarketContext';
-import { socket } from '../../lib/socket';
-import axios from 'axios';
-
-const API_URL = import.meta.env.VITE_API_URL;
+import { apiService } from '../../services/api';
 
 interface LiveStockChartProps {
   symbol: string;
@@ -16,16 +13,15 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Line' | 'Candlestick'> | null>(null);
   const [loading, setLoading] = useState(true);
-  const [isConnected, setIsConnected] = useState(false);
-  const { marketState } = useMarket();
+  const { socket, isConnected, marketState, subscribeToSymbol, unsubscribeFromSymbol } = useMarket();
   
   const rawDataRef = useRef<any[]>([]);
   const isDisposedRef = useRef(false);
 
-  const parseTimestamp = (timestamp: string): number => {
+  const parseTimestamp = useCallback((timestamp: string): number => {
     const date = new Date(timestamp);
     return Math.floor(date.getTime() / 1000);
-  };
+  }, []);
 
   const create30SecondCandles = useCallback((data: any[]) => {
     const candles: any[] = [];
@@ -59,10 +55,9 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
     }
 
     return candles;
-  }, []);
+  }, [parseTimestamp]);
 
   const updateChartData = useCallback(() => {
-    // Check if chart is disposed or not ready
     if (isDisposedRef.current || !seriesRef.current || !rawDataRef.current.length) {
       return;
     }
@@ -79,10 +74,9 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         seriesRef.current.setData(lineData);
       }
     } catch (error) {
-      // Chart might be disposed, ignore the error
       console.debug('Chart update skipped:', error);
     }
-  }, [chartType, create30SecondCandles]);
+  }, [chartType, create30SecondCandles, parseTimestamp]);
 
   // Initialize chart
   useEffect(() => {
@@ -141,11 +135,6 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
     
     window.addEventListener('resize', handleResize);
 
-    // Set initial data if available
-    if (rawDataRef.current.length > 0) {
-      updateChartData();
-    }
-
     return () => {
       isDisposedRef.current = true;
       window.removeEventListener('resize', handleResize);
@@ -159,27 +148,28 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         seriesRef.current = null;
       }
     };
-  }, [chartType]); // Only recreate when chartType changes
+  }, [chartType]);
 
-  // Data loading and socket management
+  // Load contest data and set up WebSocket
   useEffect(() => {
-    if (!symbol) return;
+    if (!symbol || !socket) return;
 
     let mounted = true;
 
-    const loadInitialData = async () => {
+    const loadContestData = async () => {
       try {
         setLoading(true);
-        const { data } = await axios.get(
-          `${API_URL}/history/${symbol}/range?from=0&to=${marketState.currentTickIndex || 0}`
-        );
+        
+        // Load complete contest data from start to current tick
+        const { data } = await apiService.getContestData(symbol, 0, marketState.currentDataTick);
         
         if (data.data && data.data.length > 0 && mounted && !isDisposedRef.current) {
           rawDataRef.current = data.data;
           updateChartData();
+          console.log(`📈 Loaded contest data for ${symbol}: ${data.data.length} points from contest start`);
         }
       } catch (error) {
-        console.error('Failed to load initial data:', error);
+        console.error('Failed to load contest data:', error);
       } finally {
         if (mounted) {
           setLoading(false);
@@ -187,23 +177,14 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       }
     };
 
-    const handleConnect = () => {
-      if (!mounted) return;
-      console.log('✅ Connected to market');
-      setIsConnected(true);
-      socket.emit('join_symbol', symbol);
-    };
+    // Subscribe to symbol updates
+    subscribeToSymbol(symbol);
 
-    const handleDisconnect = () => {
-      if (!mounted) return;
-      console.log('❌ Disconnected from market');
-      setIsConnected(false);
-    };
-
-    const handleHistoricalData = (data: any) => {
+    // Set up socket listeners
+    const handleContestData = (data: any) => {
       if (!mounted || isDisposedRef.current) return;
       if (data.symbol === symbol && data.data) {
-        console.log(`Received historical data for ${symbol}: ${data.data.length} points`);
+        console.log(`📊 Received contest data for ${symbol}: ${data.data.length} points`);
         rawDataRef.current = data.data;
         updateChartData();
       }
@@ -214,6 +195,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       if (data.symbol === symbol && data.data) {
         rawDataRef.current.push(data.data);
         updateChartData();
+        console.log(`📈 New tick for ${symbol} at tick ${data.tickIndex}: ₹${data.data.last_traded_price}`);
       }
     };
 
@@ -228,28 +210,21 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       }
     };
 
-    loadInitialData();
-
-    socket.on('connect', handleConnect);
-    socket.on('disconnect', handleDisconnect);
-    socket.on('historical_data', handleHistoricalData);
+    socket.on('contest_data', handleContestData);
     socket.on('symbol_tick', handleSymbolTick);
     socket.on('market_tick', handleMarketTick);
 
-    if (socket.connected) {
-      handleConnect();
-    }
+    // Load initial data
+    loadContestData();
 
     return () => {
       mounted = false;
-      socket.emit('leave_symbol', symbol);
-      socket.off('connect', handleConnect);
-      socket.off('disconnect', handleDisconnect);
-      socket.off('historical_data', handleHistoricalData);
+      unsubscribeFromSymbol(symbol);
+      socket.off('contest_data', handleContestData);
       socket.off('symbol_tick', handleSymbolTick);
       socket.off('market_tick', handleMarketTick);
     };
-  }, [symbol, marketState.currentTickIndex, updateChartData]);
+  }, [symbol, socket, marketState.currentDataTick, subscribeToSymbol, unsubscribeFromSymbol, updateChartData]);
 
   return (
     <div className="bg-gray-900 rounded-lg p-4">
@@ -273,7 +248,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
                 {marketState.isPaused ? '⏸️ Paused' : '▶️ Live'} @ {marketState.speed}x
               </span>
               <span className="text-xs text-gray-500">
-                Tick: {marketState.currentTickIndex}/{marketState.totalTicks}
+                Tick: {marketState.currentDataTick}/{marketState.totalDataTicks}
               </span>
             </>
           )}
@@ -301,7 +276,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
 
       {loading && (
         <div className="flex justify-center items-center h-[400px]">
-          <div className="text-gray-400">Loading chart data...</div>
+          <div className="text-gray-400">Loading contest chart data...</div>
         </div>
       )}
       
@@ -316,7 +291,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       {!marketState.isRunning && !loading && (
         <div className="mt-4 p-4 bg-yellow-900/20 border border-yellow-700 rounded-lg">
           <p className="text-yellow-400 text-sm">
-            ⚠️ Market is not running. Use admin controls to start the contest.
+            ⚠️ Contest is not running. Use admin controls to start the contest to see live data.
           </p>
         </div>
       )}

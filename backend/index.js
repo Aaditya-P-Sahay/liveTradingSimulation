@@ -26,15 +26,14 @@ if (missingEnvVars.length > 0) {
 
 console.log('✅ Environment variables loaded');
 console.log(`🔗 Supabase URL: ${process.env.SUPABASE_URL}`);
-console.log(`🔑 Using Anon Key (RLS is disabled)`);
 
 const app = express();
 const server = createServer(app);
 
-// Configure Socket.IO
+// Configure Socket.IO with multi-room support
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:5173", "http://localhost:3000", process.env.FRONTEND_URL],
+    origin: ["http://localhost:5173", "http://localhost:3000", "http://localhost:5174", process.env.FRONTEND_URL],
     methods: ["GET", "POST"],
     credentials: true
   },
@@ -46,7 +45,7 @@ const io = new Server(server, {
   allowEIO3: true
 });
 
-// Single Supabase client - works because RLS is disabled
+// Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
@@ -56,154 +55,40 @@ const supabase = createClient(
 app.use(helmet());
 app.use(compression());
 app.use(cors({
-  origin: ["http://localhost:5173", "http://localhost:3000", process.env.FRONTEND_URL],
+  origin: ["http://localhost:5173", "http://localhost:3000", "http://localhost:5174", process.env.FRONTEND_URL],
   credentials: true
 }));
 app.use(express.json());
 
-// ==================== GLOBAL MARKET STATE ====================
-const globalMarketState = {
+// ==================== CONTEST STATE MANAGEMENT ====================
+const contestState = {
   isRunning: false,
   isPaused: false,
-  startTime: null,
-  currentTickIndex: 0,
-  totalTicks: 0,
-  speed: 2,
-  intervalId: null,
   contestId: null,
-  maxDuration: 60 * 60 * 1000,
-  symbols: []
+  
+  // Timeline management
+  dataStartTime: null,        // When market data begins (first tick)
+  contestStartTime: null,     // When contest officially starts
+  adminStartTime: null,       // When admin clicked start
+  
+  // Data management
+  currentDataTick: 0,         // Current position in dataset
+  totalDataTicks: 0,          // Total ticks in dataset
+  contestDurationTicks: 3600, // Contest length (1 hour = 3600 ticks)
+  speed: 2,                   // Playback speed multiplier
+  
+  // Data and state
+  symbols: [],
+  intervalId: null,
+  maxDuration: 60 * 60 * 1000 // 1 hour maximum
 };
 
-// In-memory data store
-const stockDataCache = new Map();
-const connectedUsers = new Set();
-const userSockets = new Map();
-const portfolioCache = new Map();
+// In-memory data stores
+const stockDataCache = new Map();      // symbol -> array of tick data
+const connectedUsers = new Map();      // socketId -> userInfo
+const userSockets = new Map();         // userEmail -> socketId
+const portfolioCache = new Map();      // userEmail -> portfolio
 const leaderboardCache = [];
-
-// ==================== CONTEST STATE PERSISTENCE ====================
-
-async function saveContestState() {
-  try {
-    if (!globalMarketState.contestId) return;
-    
-    const { error } = await supabase
-      .from('contest_state')
-      .upsert({
-        id: globalMarketState.contestId,
-        is_running: globalMarketState.isRunning,
-        is_paused: globalMarketState.isPaused,
-        start_time: globalMarketState.startTime,
-        current_tick_index: globalMarketState.currentTickIndex,
-        total_ticks: globalMarketState.totalTicks,
-        speed: globalMarketState.speed,
-        symbols: globalMarketState.symbols,
-        updated_at: new Date().toISOString()
-      });
-
-    if (error) throw error;
-    console.log('✅ Contest state saved');
-  } catch (error) {
-    console.error('Error saving contest state:', error);
-  }
-}
-
-async function loadContestState() {
-  try {
-    const { data, error } = await supabase
-      .from('contest_state')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error && error.code !== 'PGRST116') throw error;
-    
-    if (data && data.is_running && !data.is_paused) {
-      globalMarketState.contestId = data.id;
-      globalMarketState.isRunning = data.is_running;
-      globalMarketState.isPaused = data.is_paused;
-      globalMarketState.startTime = new Date(data.start_time);
-      globalMarketState.currentTickIndex = data.current_tick_index;
-      globalMarketState.totalTicks = data.total_ticks;
-      globalMarketState.speed = data.speed || 2;
-      globalMarketState.symbols = data.symbols || [];
-      
-      console.log(`📊 Resuming contest from tick ${globalMarketState.currentTickIndex}`);
-      return true;
-    }
-    
-    return false;
-  } catch (error) {
-    console.error('Error loading contest state:', error);
-    return false;
-  }
-}
-
-// ==================== AUTHENTICATION MIDDLEWARE ====================
-
-async function authenticateToken(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization;
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Access token required' });
-    }
-
-    // Check for test token
-    try {
-      const decoded = JSON.parse(Buffer.from(token, 'base64').toString());
-      if (decoded.test && decoded.exp > Date.now()) {
-        const { data: userData } = await supabase
-          .from('users')
-          .select('*')
-          .eq("Candidate's Email", decoded.email)
-          .single();
-        
-        if (userData) {
-          req.user = userData;
-          req.auth_user = { id: 'test', email: decoded.email };
-          return next();
-        }
-      }
-    } catch (e) {
-      // Not a test token
-    }
-
-    // Normal Supabase auth
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-    
-    if (error || !user) {
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-
-    const { data: userData, error: userError } = await supabase
-      .from('users')
-      .select('*')
-      .eq('auth_id', user.id)
-      .single();
-
-    if (userError || !userData) {
-      return res.status(401).json({ error: 'User not found' });
-    }
-
-    req.user = userData;
-    req.auth_user = user;
-    next();
-  } catch (error) {
-    console.error('Authentication error:', error);
-    res.status(401).json({ error: 'Authentication failed' });
-  }
-}
-
-async function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  next();
-}
 
 // ==================== UTILITY FUNCTIONS ====================
 
@@ -230,19 +115,106 @@ function getCurrentPrice(symbol) {
   const data = stockDataCache.get(symbol);
   if (!data || data.length === 0) return null;
   
-  const tickIndex = Math.min(globalMarketState.currentTickIndex, data.length - 1);
+  const tickIndex = Math.min(contestState.currentDataTick, data.length - 1);
   return data[tickIndex]?.last_traded_price || null;
 }
 
-function getHistoricalDataUpToTick(symbol, endTick = null) {
+function getContestDataUpToTick(symbol, endTick = null) {
   const data = stockDataCache.get(symbol);
   if (!data || data.length === 0) return [];
   
   const toTick = endTick !== null ? 
     Math.min(endTick, data.length - 1) : 
-    Math.min(globalMarketState.currentTickIndex, data.length - 1);
+    Math.min(contestState.currentDataTick, data.length - 1);
   
   return data.slice(0, toTick + 1);
+}
+
+// ==================== AUTHENTICATION MIDDLEWARE ====================
+
+async function authenticateToken(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({ error: 'Access token required' });
+    }
+
+    // Check for test token first (for development)
+    try {
+      const decoded = JSON.parse(Buffer.from(token, 'base64').toString());
+      if (decoded.test && decoded.exp > Date.now()) {
+        const { data: userData } = await supabase
+          .from('users')
+          .select('*')
+          .eq("Candidate's Email", decoded.email)
+          .single();
+        
+        if (userData) {
+          req.user = userData;
+          req.auth_user = { id: 'test', email: decoded.email };
+          return next();
+        }
+      }
+    } catch (e) {
+      // Not a test token, continue with normal auth
+    }
+
+    // Normal Supabase auth
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    
+    if (error || !user) {
+      console.error('Token verification failed:', error);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // FIXED: Try both auth_id lookup and email lookup for existing users
+    let { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('auth_id', user.id)
+      .single();
+
+    // If not found by auth_id, try email (for existing users)
+    if (userError && userError.code === 'PGRST116') {
+      const { data: emailData, error: emailError } = await supabase
+        .from('users')
+        .select('*')
+        .eq("Candidate's Email", user.email)
+        .single();
+      
+      if (emailData && !emailError) {
+        // Update the user record with auth_id for future lookups
+        await supabase
+          .from('users')
+          .update({ auth_id: user.id })
+          .eq("Candidate's Email", user.email);
+        
+        userData = emailData;
+        userError = null;
+      }
+    }
+
+    if (userError || !userData) {
+      console.error('User not found:', userError);
+      return res.status(401).json({ error: 'User profile not found' });
+    }
+
+    req.user = userData;
+    req.auth_user = user;
+    next();
+  } catch (error) {
+    console.error('Authentication error:', error);
+    res.status(401).json({ error: 'Authentication failed' });
+  }
+}
+
+async function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
 }
 
 // ==================== PORTFOLIO & TRADING FUNCTIONS ====================
@@ -264,7 +236,8 @@ async function getOrCreatePortfolio(userEmail) {
         total_wealth: 1000000,
         short_value: 0,
         unrealized_pnl: 0,
-        total_pnl: 0
+        total_pnl: 0,
+        realized_pnl: 0
       };
 
       const { data, error: insertError } = await supabase
@@ -286,31 +259,41 @@ async function getOrCreatePortfolio(userEmail) {
   }
 }
 
-async function updatePortfolio(userEmail) {
+async function updatePortfolioValues(userEmail) {
   try {
     const portfolio = await getOrCreatePortfolio(userEmail);
     if (!portfolio) return null;
 
-    let marketValue = 0;
-    let unrealizedPnl = 0;
+    // Calculate long positions value
+    let longMarketValue = 0;
+    let longUnrealizedPnl = 0;
 
     const holdings = portfolio.holdings || {};
     for (const [symbol, position] of Object.entries(holdings)) {
       const currentPrice = getCurrentPrice(symbol);
       if (currentPrice && position.quantity > 0) {
         const positionValue = currentPrice * position.quantity;
-        marketValue += positionValue;
-        unrealizedPnl += (currentPrice - position.avg_price) * position.quantity;
+        longMarketValue += positionValue;
+        longUnrealizedPnl += (currentPrice - position.avg_price) * position.quantity;
+        
+        // Update holdings with current values
+        holdings[symbol] = {
+          ...position,
+          current_price: currentPrice,
+          market_value: positionValue,
+          unrealized_pnl: (currentPrice - position.avg_price) * position.quantity
+        };
       }
     }
 
+    // Calculate short positions value
     const { data: shortPositions } = await supabase
       .from('short_positions')
       .select('*')
       .eq('user_email', userEmail)
       .eq('is_active', true);
 
-    let shortValue = 0;
+    let shortMarketValue = 0;
     let shortUnrealizedPnl = 0;
 
     if (shortPositions) {
@@ -318,23 +301,38 @@ async function updatePortfolio(userEmail) {
         const currentPrice = getCurrentPrice(short.symbol);
         if (currentPrice) {
           const positionValue = currentPrice * short.quantity;
-          shortValue += positionValue;
+          shortMarketValue += positionValue;
+          // For short positions: profit when price goes down
           shortUnrealizedPnl += (short.avg_short_price - currentPrice) * short.quantity;
+          
+          // Update short position
+          await supabase
+            .from('short_positions')
+            .update({
+              current_price: currentPrice,
+              unrealized_pnl: (short.avg_short_price - currentPrice) * short.quantity,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', short.id);
         }
       }
     }
 
-    const totalUnrealizedPnl = unrealizedPnl + shortUnrealizedPnl;
-    const totalWealth = portfolio.cash_balance + marketValue - shortValue;
+    // FIXED: Correct total wealth calculation
+    // Total Wealth = Cash + Long Market Value - Short Liability + All Unrealized P&L
+    const totalUnrealizedPnl = longUnrealizedPnl + shortUnrealizedPnl;
+    const totalWealth = portfolio.cash_balance + longMarketValue - shortMarketValue + totalUnrealizedPnl;
+    const totalPnl = totalUnrealizedPnl + (portfolio.realized_pnl || 0);
 
     const { data: updatedPortfolio, error } = await supabase
       .from('portfolio')
       .update({
-        market_value: marketValue,
-        short_value: shortValue,
+        holdings,
+        market_value: longMarketValue,
+        short_value: shortMarketValue,
         unrealized_pnl: totalUnrealizedPnl,
         total_wealth: totalWealth,
-        total_pnl: totalUnrealizedPnl + (portfolio.realized_pnl || 0),
+        total_pnl: totalPnl,
         last_updated: new Date().toISOString()
       })
       .eq('user_email', userEmail)
@@ -345,9 +343,10 @@ async function updatePortfolio(userEmail) {
 
     portfolioCache.set(userEmail, updatedPortfolio);
     
+    // Send portfolio update to user's socket
     const socketId = userSockets.get(userEmail);
     if (socketId) {
-      io.to(socketId).emit('portfolio_update', updatedPortfolio);
+      io.to(`user:${userEmail}`).emit('portfolio_update', updatedPortfolio);
     }
 
     return updatedPortfolio;
@@ -357,14 +356,120 @@ async function updatePortfolio(userEmail) {
   }
 }
 
+async function openShortPosition(userEmail, symbol, companyName, quantity, price) {
+  try {
+    const totalAmount = quantity * price;
+    
+    // Create short position record
+    const { data: shortPosition, error } = await supabase
+      .from('short_positions')
+      .insert({
+        user_email: userEmail,
+        symbol,
+        company_name: companyName,
+        quantity,
+        avg_short_price: price,
+        current_price: price,
+        unrealized_pnl: 0,
+        is_active: true,
+        opened_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Add cash from short sale to portfolio
+    const portfolio = await getOrCreatePortfolio(userEmail);
+    await supabase
+      .from('portfolio')
+      .update({
+        cash_balance: portfolio.cash_balance + totalAmount
+      })
+      .eq('user_email', userEmail);
+
+    return shortPosition;
+  } catch (error) {
+    console.error('Error opening short position:', error);
+    throw error;
+  }
+}
+
+async function closeShortPosition(userEmail, symbol, quantity, price) {
+  try {
+    // Get active short positions for this symbol
+    const { data: shortPositions } = await supabase
+      .from('short_positions')
+      .select('*')
+      .eq('user_email', userEmail)
+      .eq('symbol', symbol)
+      .eq('is_active', true)
+      .order('opened_at', { ascending: true });
+
+    if (!shortPositions || shortPositions.length === 0) {
+      throw new Error('No active short positions found for this symbol');
+    }
+
+    let remainingQuantity = quantity;
+    let totalCost = 0;
+    let totalRealizedPnl = 0;
+
+    for (const position of shortPositions) {
+      if (remainingQuantity <= 0) break;
+      
+      const quantityToCover = Math.min(remainingQuantity, position.quantity);
+      const cost = quantityToCover * price;
+      const pnl = (position.avg_short_price - price) * quantityToCover;
+      
+      totalCost += cost;
+      totalRealizedPnl += pnl;
+      remainingQuantity -= quantityToCover;
+      
+      if (quantityToCover === position.quantity) {
+        // Close entire position
+        await supabase
+          .from('short_positions')
+          .update({ is_active: false, updated_at: new Date().toISOString() })
+          .eq('id', position.id);
+      } else {
+        // Partially close position
+        await supabase
+          .from('short_positions')
+          .update({
+            quantity: position.quantity - quantityToCover,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', position.id);
+      }
+    }
+
+    if (remainingQuantity > 0) {
+      throw new Error(`Insufficient short positions. Missing ${remainingQuantity} shares`);
+    }
+
+    // Update portfolio cash and realized P&L
+    const portfolio = await getOrCreatePortfolio(userEmail);
+    await supabase
+      .from('portfolio')
+      .update({
+        cash_balance: portfolio.cash_balance - totalCost,
+        realized_pnl: (portfolio.realized_pnl || 0) + totalRealizedPnl
+      })
+      .eq('user_email', userEmail);
+
+    return { totalCost, totalRealizedPnl };
+  } catch (error) {
+    console.error('Error closing short position:', error);
+    throw error;
+  }
+}
+
 async function executeTrade(userEmail, symbol, companyName, orderType, quantity, price) {
   try {
-    const portfolio = await getOrCreatePortfolio(userEmail);
-    if (!portfolio) throw new Error('Failed to get portfolio');
-
     const totalAmount = price * quantity;
     
     if (orderType === 'buy') {
+      const portfolio = await getOrCreatePortfolio(userEmail);
       if (portfolio.cash_balance < totalAmount) {
         throw new Error('Insufficient cash balance');
       }
@@ -372,17 +477,20 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       const holdings = portfolio.holdings || {};
       if (holdings[symbol]) {
         const newQuantity = holdings[symbol].quantity + quantity;
-        const newAvgPrice = ((holdings[symbol].avg_price * holdings[symbol].quantity) + (price * quantity)) / newQuantity;
+        const newAvgPrice = ((holdings[symbol].avg_price * holdings[symbol].quantity) + totalAmount) / newQuantity;
         holdings[symbol] = {
+          ...holdings[symbol],
           quantity: newQuantity,
-          avg_price: newAvgPrice,
-          company_name: companyName
+          avg_price: newAvgPrice
         };
       } else {
         holdings[symbol] = {
           quantity,
           avg_price: price,
-          company_name: companyName
+          company_name: companyName,
+          current_price: price,
+          market_value: totalAmount,
+          unrealized_pnl: 0
         };
       }
       
@@ -395,25 +503,41 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         .eq('user_email', userEmail);
         
     } else if (orderType === 'sell') {
+      const portfolio = await getOrCreatePortfolio(userEmail);
       const holdings = portfolio.holdings || {};
+      
       if (!holdings[symbol] || holdings[symbol].quantity < quantity) {
         throw new Error('Insufficient holdings');
       }
       
+      const position = holdings[symbol];
+      const realizedPnl = (price - position.avg_price) * quantity;
+      
       holdings[symbol].quantity -= quantity;
       if (holdings[symbol].quantity === 0) {
         delete holdings[symbol];
+      } else {
+        holdings[symbol].market_value = holdings[symbol].quantity * price;
+        holdings[symbol].unrealized_pnl = (price - holdings[symbol].avg_price) * holdings[symbol].quantity;
       }
       
       await supabase
         .from('portfolio')
         .update({
           cash_balance: portfolio.cash_balance + totalAmount,
-          holdings
+          holdings,
+          realized_pnl: (portfolio.realized_pnl || 0) + realizedPnl
         })
         .eq('user_email', userEmail);
+        
+    } else if (orderType === 'short_sell') {
+      await openShortPosition(userEmail, symbol, companyName, quantity, price);
+      
+    } else if (orderType === 'buy_to_cover') {
+      await closeShortPosition(userEmail, symbol, quantity, price);
     }
     
+    // Record the trade
     const { data: trade, error } = await supabase
       .from('trades')
       .insert({
@@ -431,7 +555,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
 
     if (error) throw error;
 
-    const updatedPortfolio = await updatePortfolio(userEmail);
+    const updatedPortfolio = await updatePortfolioValues(userEmail);
 
     return { trade, portfolio: updatedPortfolio };
   } catch (error) {
@@ -461,44 +585,22 @@ async function updateLeaderboard() {
       user_email: p.user_email,
       total_wealth: p.total_wealth,
       total_pnl: p.total_pnl,
-      return_percentage: ((p.total_wealth - 1000000) / 1000000) * 100
+      return_percentage: ((p.total_wealth - 1000000) / 1000000) * 100,
+      cash_balance: p.cash_balance,
+      market_value: p.market_value,
+      short_value: p.short_value
     }));
 
     leaderboardCache.length = 0;
     leaderboardCache.push(...leaderboard);
 
+    // Broadcast leaderboard update to all contest participants
+    io.to(`contest:${contestState.contestId}`).emit('leaderboard_update', leaderboard.slice(0, 10));
+
     return leaderboard;
   } catch (error) {
     console.error('Error updating leaderboard:', error);
     return [];
-  }
-}
-
-async function saveContestResults() {
-  try {
-    if (!globalMarketState.contestId) return;
-
-    const leaderboard = await updateLeaderboard();
-    
-    const { error } = await supabase
-      .from('contest_results')
-      .insert({
-        contest_id: globalMarketState.contestId,
-        end_time: new Date().toISOString(),
-        final_leaderboard: leaderboard,
-        total_participants: leaderboard.length,
-        winner: leaderboard[0] || null
-      });
-
-    if (error) throw error;
-    
-    console.log('✅ Contest results saved');
-    console.log('🏆 Winner:', leaderboard[0]?.user_name || 'No participants');
-    
-    return leaderboard;
-  } catch (error) {
-    console.error('Error saving contest results:', error);
-    return null;
   }
 }
 
@@ -553,8 +655,11 @@ async function loadStockData(symbol) {
     stockDataCache.set(symbol, processedData);
     console.log(`✅ Loaded ${processedData.length} total data points for ${symbol}`);
     
-    if (globalMarketState.totalTicks === 0 || processedData.length < globalMarketState.totalTicks) {
-      globalMarketState.totalTicks = processedData.length;
+    // Update contest total ticks to minimum across all symbols
+    if (contestState.totalDataTicks === 0) {
+      contestState.totalDataTicks = processedData.length;
+    } else {
+      contestState.totalDataTicks = Math.min(contestState.totalDataTicks, processedData.length);
     }
     
     return processedData;
@@ -571,8 +676,6 @@ async function getAvailableSymbols() {
     const uniqueSymbols = new Set();
     let lastId = 0;
     let batchCount = 0;
-    let noNewSymbolsCount = 0;
-    let previousSize = 0;
     
     while (batchCount < 100) {
       const { data: batch, error } = await supabase
@@ -591,8 +694,6 @@ async function getAvailableSymbols() {
         break;
       }
       
-      previousSize = uniqueSymbols.size;
-      
       batch.forEach(row => {
         if (row.symbol) {
           uniqueSymbols.add(row.symbol);
@@ -600,16 +701,6 @@ async function getAvailableSymbols() {
       });
       
       console.log(`  Batch ${++batchCount}: ${batch.length} rows, ${uniqueSymbols.size} unique symbols so far`);
-      
-      if (uniqueSymbols.size === previousSize) {
-        noNewSymbolsCount++;
-        if (noNewSymbolsCount >= 3) {
-          console.log('  No new symbols found in 3 batches, stopping search');
-          break;
-        }
-      } else {
-        noNewSymbolsCount = 0;
-      }
       
       lastId = batch[batch.length - 1].unique_id;
       
@@ -628,118 +719,230 @@ async function getAvailableSymbols() {
   }
 }
 
-// ==================== GLOBAL MARKET SIMULATION ====================
+// ==================== CONTEST STATE PERSISTENCE ====================
 
-async function startGlobalMarketSimulation() {
-  if (globalMarketState.isRunning && !globalMarketState.isPaused) {
-    console.log('Market simulation already running');
+async function saveContestState() {
+  try {
+    if (!contestState.contestId) return;
+    
+    const { error } = await supabase
+      .from('contest_state')
+      .upsert({
+        id: contestState.contestId,
+        is_running: contestState.isRunning,
+        is_paused: contestState.isPaused,
+        start_time: contestState.contestStartTime,
+        current_tick_index: contestState.currentDataTick,
+        total_ticks: contestState.totalDataTicks,
+        speed: contestState.speed,
+        symbols: contestState.symbols,
+        updated_at: new Date().toISOString()
+      });
+
+    if (error) throw error;
+    console.log('✅ Contest state saved');
+  } catch (error) {
+    console.error('Error saving contest state:', error);
+  }
+}
+
+async function loadContestState() {
+  try {
+    const { data, error } = await supabase
+      .from('contest_state')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') throw error;
+    
+    if (data && data.is_running && !data.is_paused) {
+      contestState.contestId = data.id;
+      contestState.isRunning = data.is_running;
+      contestState.isPaused = data.is_paused;
+      contestState.contestStartTime = new Date(data.start_time);
+      contestState.currentDataTick = data.current_tick_index;
+      contestState.totalDataTicks = data.total_ticks;
+      contestState.speed = data.speed || 2;
+      contestState.symbols = data.symbols || [];
+      
+      console.log(`📊 Resuming contest from tick ${contestState.currentDataTick}`);
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('Error loading contest state:', error);
+    return false;
+  }
+}
+
+async function saveContestResults() {
+  try {
+    if (!contestState.contestId) return;
+
+    const leaderboard = await updateLeaderboard();
+    
+    const { error } = await supabase
+      .from('contest_results')
+      .insert({
+        contest_id: contestState.contestId,
+        end_time: new Date().toISOString(),
+        final_leaderboard: leaderboard,
+        total_participants: leaderboard.length,
+        winner: leaderboard[0] || null
+      });
+
+    if (error) throw error;
+    
+    console.log('✅ Contest results saved');
+    console.log('🏆 Winner:', leaderboard[0]?.user_name || 'No participants');
+    
+    return leaderboard;
+  } catch (error) {
+    console.error('Error saving contest results:', error);
+    return null;
+  }
+}
+
+// ==================== CONTEST MANAGEMENT ====================
+
+async function startContest() {
+  if (contestState.isRunning && !contestState.isPaused) {
+    console.log('Contest already running');
     return;
   }
 
-  if (globalMarketState.isPaused) {
-    globalMarketState.isPaused = false;
-    console.log('📊 Resuming market simulation');
+  if (contestState.isPaused) {
+    contestState.isPaused = false;
+    console.log('📊 Resuming contest');
     await saveContestState();
     return;
   }
 
-  globalMarketState.isRunning = true;
-  globalMarketState.isPaused = false;
-  globalMarketState.startTime = new Date();
-  globalMarketState.currentTickIndex = 0;
-  globalMarketState.contestId = crypto.randomUUID();
+  contestState.isRunning = true;
+  contestState.isPaused = false;
+  contestState.contestId = crypto.randomUUID();
+  contestState.adminStartTime = new Date();
+  contestState.contestStartTime = new Date();
+  contestState.currentDataTick = 0;
   
   const symbols = await getAvailableSymbols();
-  globalMarketState.symbols = symbols;
+  contestState.symbols = symbols;
   
   console.log('📊 Loading market data for all symbols...');
   for (const symbol of symbols) {
     await loadStockData(symbol);
   }
   
-  console.log(`🚀 Starting global market simulation at ${globalMarketState.speed}x speed`);
-  console.log(`📈 Total ticks: ${globalMarketState.totalTicks}`);
-  console.log(`⏱️  Expected duration: ${(globalMarketState.totalTicks * 500) / 60000} minutes`);
+  // Set data start time to first tick
+  if (symbols.length > 0 && stockDataCache.has(symbols[0])) {
+    const firstData = stockDataCache.get(symbols[0])[0];
+    contestState.dataStartTime = new Date(firstData.normalized_timestamp);
+  }
+  
+  console.log(`🚀 Starting contest at ${contestState.speed}x speed`);
+  console.log(`📈 Total ticks: ${contestState.totalDataTicks}`);
+  console.log(`⏱️  Expected duration: ${(contestState.totalDataTicks * 500 / contestState.speed) / 60000} minutes`);
   
   await saveContestState();
   
-  globalMarketState.intervalId = setInterval(async () => {
-    if (globalMarketState.isPaused) return;
+  // Start the contest simulation
+  contestState.intervalId = setInterval(async () => {
+    if (contestState.isPaused) return;
     
-    const elapsedTime = Date.now() - globalMarketState.startTime.getTime();
-    if (elapsedTime >= globalMarketState.maxDuration) {
-      console.log('⏰ Contest duration reached (1 hour). Stopping simulation.');
-      await stopGlobalMarketSimulation();
+    const elapsedTime = Date.now() - contestState.adminStartTime.getTime();
+    if (elapsedTime >= contestState.maxDuration) {
+      console.log('⏰ Contest duration reached (1 hour). Stopping contest.');
+      await stopContest();
       return;
     }
     
-    if (globalMarketState.currentTickIndex >= globalMarketState.totalTicks) {
-      console.log('📊 All market data exhausted. Stopping simulation.');
-      await stopGlobalMarketSimulation();
+    if (contestState.currentDataTick >= contestState.totalDataTicks) {
+      console.log('📊 All market data exhausted. Stopping contest.');
+      await stopContest();
       return;
     }
     
-    globalMarketState.currentTickIndex++;
+    contestState.currentDataTick++;
     
+    // Broadcast current tick data to all symbol rooms
     const tickData = {};
-    for (const symbol of globalMarketState.symbols) {
+    for (const symbol of contestState.symbols) {
       const price = getCurrentPrice(symbol);
       if (price) {
         tickData[symbol] = price;
+        
+        // Get current tick data
+        const data = stockDataCache.get(symbol);
+        if (data && data[contestState.currentDataTick]) {
+          // Send to symbol-specific rooms
+          io.to(`symbol:${symbol}`).emit('symbol_tick', {
+            symbol,
+            data: data[contestState.currentDataTick],
+            tickIndex: contestState.currentDataTick,
+            totalTicks: contestState.totalDataTicks,
+            progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100
+          });
+        }
       }
     }
     
-    io.emit('market_tick', {
-      tickIndex: globalMarketState.currentTickIndex,
-      totalTicks: globalMarketState.totalTicks,
+    // Broadcast market-wide tick to contest room
+    io.to(`contest:${contestState.contestId}`).emit('market_tick', {
+      tickIndex: contestState.currentDataTick,
+      totalTicks: contestState.totalDataTicks,
       timestamp: new Date().toISOString(),
       prices: tickData,
-      progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100
+      progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
+      contestStartTime: contestState.contestStartTime,
+      dataStartTime: contestState.dataStartTime
     });
     
-    for (const symbol of globalMarketState.symbols) {
-      const data = stockDataCache.get(symbol);
-      if (data && data[globalMarketState.currentTickIndex]) {
-        io.to(symbol).emit('symbol_tick', {
-          symbol,
-          data: data[globalMarketState.currentTickIndex],
-          tickIndex: globalMarketState.currentTickIndex
-        });
+    // Update portfolios and leaderboard periodically
+    if (contestState.currentDataTick % 10 === 0) {
+      // Update all user portfolios
+      const portfolios = Array.from(portfolioCache.keys());
+      for (const userEmail of portfolios) {
+        await updatePortfolioValues(userEmail);
       }
     }
     
-    if (globalMarketState.currentTickIndex % 100 === 0) {
+    if (contestState.currentDataTick % 100 === 0) {
       await saveContestState();
       await updateLeaderboard();
     }
     
-  }, 500 / globalMarketState.speed);
+  }, 500 / contestState.speed);
 }
 
-async function stopGlobalMarketSimulation() {
-  if (!globalMarketState.isRunning) {
-    console.log('Market simulation not running');
+async function stopContest() {
+  if (!contestState.isRunning) {
+    console.log('Contest not running');
     return;
   }
 
-  if (globalMarketState.intervalId) {
-    clearInterval(globalMarketState.intervalId);
-    globalMarketState.intervalId = null;
+  if (contestState.intervalId) {
+    clearInterval(contestState.intervalId);
+    contestState.intervalId = null;
   }
 
-  globalMarketState.isRunning = false;
-  globalMarketState.isPaused = false;
+  contestState.isRunning = false;
+  contestState.isPaused = false;
   
   const finalResults = await saveContestResults();
   
-  io.emit('market_stopped', {
-    message: 'Market simulation has ended',
-    finalResults: finalResults?.slice(0, 10)
+  io.to(`contest:${contestState.contestId}`).emit('contest_ended', {
+    message: 'Contest has ended',
+    finalResults: finalResults?.slice(0, 10),
+    totalTicks: contestState.totalDataTicks,
+    endTime: new Date().toISOString()
   });
   
   await saveContestState();
   
-  console.log('🛑 Market simulation stopped');
+  console.log('🛑 Contest stopped');
 }
 
 function groupIntoCandlesticks(data, interval) {
@@ -799,11 +1002,12 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     connectedUsers: connectedUsers.size,
-    marketState: {
-      isRunning: globalMarketState.isRunning,
-      isPaused: globalMarketState.isPaused,
-      currentTick: globalMarketState.currentTickIndex,
-      totalTicks: globalMarketState.totalTicks
+    contestState: {
+      isRunning: contestState.isRunning,
+      isPaused: contestState.isPaused,
+      currentTick: contestState.currentDataTick,
+      totalTicks: contestState.totalDataTicks,
+      contestId: contestState.contestId
     },
     uptime: process.uptime()
   });
@@ -829,24 +1033,33 @@ app.post('/api/auth/signup', async (req, res) => {
 
     if (authError) throw authError;
 
-    const { data: userData, error: userError } = await supabase
-      .from('users')
-      .insert({
-        auth_id: authData.user.id,
-        "Candidate's Email": email,
-        "Candidate's Name": full_name || email.split('@')[0],
-        role: 'user',
-        created_at: new Date().toISOString()
-      })
-      .select()
-      .single();
+    if (authData.user) {
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .insert({
+          auth_id: authData.user.id,
+          "Candidate's Email": email,
+          "Candidate's Name": full_name || email.split('@')[0],
+          role: 'user',
+          created_at: new Date().toISOString()
+        })
+        .select()
+        .single();
 
-    if (userError) throw userError;
+      if (userError) {
+        console.log('Warning: Failed to create user record:', userError);
+      }
+    }
 
     res.json({
       success: true,
-      user: userData,
-      token: authData.session?.access_token
+      user: {
+        email: email,
+        name: full_name || email.split('@')[0],
+        role: 'user'
+      },
+      token: authData.session?.access_token,
+      message: authData.session ? 'Account created successfully' : 'Please verify your email'
     });
   } catch (error) {
     console.error('Signup error:', error);
@@ -862,27 +1075,73 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
 
+    console.log('🔐 Login attempt for:', email);
+
     const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password
     });
 
-    if (error) throw error;
+    if (error) {
+      console.error('Supabase auth error:', error);
+      return res.status(401).json({ error: error.message });
+    }
 
-    const { data: userData } = await supabase
+    if (!data.user || !data.session) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    console.log('✅ Supabase Auth successful for:', email);
+
+    // FIXED: Try both auth_id and email lookup
+    let { data: userData, error: userError } = await supabase
       .from('users')
       .select('*')
       .eq('auth_id', data.user.id)
       .single();
 
+    // If not found by auth_id, try email lookup for existing users
+    if (userError && userError.code === 'PGRST116') {
+      const { data: emailData, error: emailError } = await supabase
+        .from('users')
+        .select('*')
+        .eq("Candidate's Email", email)
+        .single();
+      
+      if (emailData && !emailError) {
+        // Update user with auth_id for future lookups
+        await supabase
+          .from('users')
+          .update({ auth_id: data.user.id })
+          .eq("Candidate's Email", email);
+        
+        userData = emailData;
+        userError = null;
+        console.log('✅ Updated existing user with auth_id');
+      }
+    }
+
+    if (userError) {
+      console.error('User lookup error:', userError);
+      return res.status(404).json({ error: 'User profile not found. Contact admin.' });
+    }
+
+    console.log('✅ Login successful for:', email, 'Role:', userData.role);
+
     res.json({
       success: true,
-      user: userData || { email: data.user.email },
-      token: data.session.access_token
+      user: {
+        email: userData["Candidate's Email"],
+        name: userData["Candidate's Name"] || email.split('@')[0],
+        role: userData.role || 'user'
+      },
+      token: data.session.access_token,
+      refresh_token: data.session.refresh_token
     });
+
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(401).json({ error: 'Invalid credentials' });
+    console.error('❌ Login error:', error);
+    res.status(500).json({ error: 'Login failed: ' + error.message });
   }
 });
 
@@ -890,7 +1149,11 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     res.json({
       success: true,
-      user: req.user
+      user: {
+        email: req.user["Candidate's Email"],
+        name: req.user["Candidate's Name"],
+        role: req.user.role
+      }
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -905,40 +1168,79 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   }
 });
 
+// TEMPORARY TEST ENDPOINT - REMOVE IN PRODUCTION
+app.post('/api/test/create-test-user', async (req, res) => {
+  try {
+    const testEmail = `test_${Date.now()}@example.com`;
+    const testUser = {
+      "Candidate's Email": testEmail,
+      "Candidate's Name": "Test User",
+      auth_id: crypto.randomUUID(),
+      role: "user",
+      created_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('users')
+      .insert(testUser)
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    const fakeToken = Buffer.from(JSON.stringify({
+      email: testEmail,
+      test: true,
+      exp: Date.now() + 86400000
+    })).toString('base64');
+    
+    res.json({
+      user: data,
+      token: fakeToken
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ===== MARKET DATA ROUTES =====
 
 app.get('/api/symbols', async (req, res) => {
   try {
-    const symbols = await getAvailableSymbols();
+    const symbols = contestState.symbols.length > 0 ? contestState.symbols : await getAvailableSymbols();
     res.json(symbols);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/history/:symbol/range', async (req, res) => {
+// FIXED: Contest data endpoint - returns data from contest start (tick 0) to current
+app.get('/api/contest-data/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
     const { from, to } = req.query;
     
     let data = stockDataCache.get(symbol);
-    
     if (!data) {
       data = await loadStockData(symbol);
     }
     
     const fromTick = parseInt(from) || 0;
-    const toTick = parseInt(to) || globalMarketState.currentTickIndex;
+    const toTick = parseInt(to) || contestState.currentDataTick;
     
-    const rangeData = data.slice(fromTick, Math.min(toTick + 1, data.length));
+    const contestData = data.slice(fromTick, Math.min(toTick + 1, data.length));
     
     res.json({
       symbol,
       fromTick,
       toTick,
-      currentMarketTick: globalMarketState.currentTickIndex,
-      data: rangeData,
-      count: rangeData.length
+      currentContestTick: contestState.currentDataTick,
+      totalContestTicks: contestState.totalDataTicks,
+      data: contestData,
+      count: contestData.length,
+      contestStartTime: contestState.contestStartTime,
+      dataStartTime: contestState.dataStartTime,
+      contestActive: contestState.isRunning
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -953,12 +1255,11 @@ app.get('/api/history/:symbol', async (req, res) => {
     const offset = (page - 1) * limit;
 
     let data = stockDataCache.get(symbol);
-    
     if (!data) {
       data = await loadStockData(symbol);
     }
 
-    const availableData = getHistoricalDataUpToTick(symbol);
+    const availableData = getContestDataUpToTick(symbol);
     const totalRecords = availableData.length;
     const totalPages = Math.ceil(totalRecords / limit);
     const paginatedData = availableData.slice(offset, offset + limit);
@@ -966,7 +1267,7 @@ app.get('/api/history/:symbol', async (req, res) => {
     res.json({
       symbol,
       data: paginatedData,
-      currentMarketTick: globalMarketState.currentTickIndex,
+      currentContestTick: contestState.currentDataTick,
       pagination: {
         page,
         limit,
@@ -986,13 +1287,13 @@ app.get('/api/candlestick/:symbol', async (req, res) => {
     const { symbol } = req.params;
     const interval = req.query.interval || '1m';
     
-    const data = getHistoricalDataUpToTick(symbol);
+    const data = getContestDataUpToTick(symbol);
     const candlesticks = groupIntoCandlesticks(data, interval);
     
     res.json({
       symbol,
       interval,
-      currentMarketTick: globalMarketState.currentTickIndex,
+      currentContestTick: contestState.currentDataTick,
       data: candlesticks
     });
   } catch (error) {
@@ -1000,22 +1301,24 @@ app.get('/api/candlestick/:symbol', async (req, res) => {
   }
 });
 
-app.get('/api/market/state', (req, res) => {
-  const elapsedTime = globalMarketState.startTime 
-    ? Date.now() - globalMarketState.startTime.getTime() 
+app.get('/api/contest/state', (req, res) => {
+  const elapsedTime = contestState.adminStartTime 
+    ? Date.now() - contestState.adminStartTime.getTime() 
     : 0;
     
   res.json({
-    isRunning: globalMarketState.isRunning,
-    isPaused: globalMarketState.isPaused,
-    startTime: globalMarketState.startTime,
-    currentTickIndex: globalMarketState.currentTickIndex,
-    totalTicks: globalMarketState.totalTicks,
+    isRunning: contestState.isRunning,
+    isPaused: contestState.isPaused,
+    contestStartTime: contestState.contestStartTime,
+    adminStartTime: contestState.adminStartTime,
+    dataStartTime: contestState.dataStartTime,
+    currentDataTick: contestState.currentDataTick,
+    totalDataTicks: contestState.totalDataTicks,
     elapsedTime,
-    progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100,
-    speed: globalMarketState.speed,
-    symbols: globalMarketState.symbols,
-    contestId: globalMarketState.contestId
+    progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
+    speed: contestState.speed,
+    symbols: contestState.symbols,
+    contestId: contestState.contestId
   });
 });
 
@@ -1038,8 +1341,8 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Quantity must be positive' });
     }
 
-    if (!globalMarketState.isRunning || globalMarketState.isPaused) {
-      return res.status(400).json({ error: 'Market is not currently active' });
+    if (!contestState.isRunning || contestState.isPaused) {
+      return res.status(400).json({ error: 'Contest is not currently active' });
     }
 
     const currentPrice = getCurrentPrice(symbol);
@@ -1065,8 +1368,9 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
       trade: result.trade,
       portfolio: result.portfolio,
       executedAt: {
-        tickIndex: globalMarketState.currentTickIndex,
-        price: currentPrice
+        contestTick: contestState.currentDataTick,
+        price: currentPrice,
+        timestamp: new Date().toISOString()
       }
     });
 
@@ -1079,7 +1383,7 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
 app.get('/api/portfolio', authenticateToken, async (req, res) => {
   try {
     const userEmail = req.user["Candidate's Email"];
-    const portfolio = await updatePortfolio(userEmail);
+    const portfolio = await updatePortfolioValues(userEmail);
     res.json(portfolio);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1116,6 +1420,34 @@ app.get('/api/trades', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/shorts', authenticateToken, async (req, res) => {
+  try {
+    const userEmail = req.user["Candidate's Email"];
+    const activeOnly = req.query.active === 'true';
+    
+    let query = supabase
+      .from('short_positions')
+      .select('*')
+      .eq('user_email', userEmail)
+      .order('opened_at', { ascending: false });
+    
+    if (activeOnly) {
+      query = query.eq('is_active', true);
+    }
+    
+    const { data: shorts, error } = await query;
+    
+    if (error) throw error;
+    
+    res.json({
+      shorts,
+      count: shorts.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
@@ -1130,23 +1462,21 @@ app.get('/api/leaderboard', async (req, res) => {
 
 app.post('/api/admin/contest/start', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    await startGlobalMarketSimulation();
-    
-    const safeState = {
-      isRunning: globalMarketState.isRunning,
-      isPaused: globalMarketState.isPaused,
-      startTime: globalMarketState.startTime,
-      currentTickIndex: globalMarketState.currentTickIndex,
-      totalTicks: globalMarketState.totalTicks,
-      speed: globalMarketState.speed,
-      contestId: globalMarketState.contestId,
-      symbols: globalMarketState.symbols
-    };
+    await startContest();
     
     res.json({ 
       success: true, 
       message: 'Contest started successfully',
-      state: safeState
+      state: {
+        isRunning: contestState.isRunning,
+        isPaused: contestState.isPaused,
+        contestStartTime: contestState.contestStartTime,
+        currentDataTick: contestState.currentDataTick,
+        totalDataTicks: contestState.totalDataTicks,
+        speed: contestState.speed,
+        contestId: contestState.contestId,
+        symbols: contestState.symbols
+      }
     });
   } catch (error) {
     console.error('Start contest error:', error);
@@ -1156,8 +1486,13 @@ app.post('/api/admin/contest/start', authenticateToken, requireAdmin, async (req
 
 app.post('/api/admin/contest/pause', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    globalMarketState.isPaused = true;
+    contestState.isPaused = true;
     await saveContestState();
+    
+    io.to(`contest:${contestState.contestId}`).emit('contest_paused', {
+      message: 'Contest has been paused'
+    });
+    
     res.json({ 
       success: true, 
       message: 'Contest paused'
@@ -1169,8 +1504,13 @@ app.post('/api/admin/contest/pause', authenticateToken, requireAdmin, async (req
 
 app.post('/api/admin/contest/resume', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    globalMarketState.isPaused = false;
+    contestState.isPaused = false;
     await saveContestState();
+    
+    io.to(`contest:${contestState.contestId}`).emit('contest_resumed', {
+      message: 'Contest has been resumed'
+    });
+    
     res.json({ 
       success: true, 
       message: 'Contest resumed'
@@ -1182,7 +1522,7 @@ app.post('/api/admin/contest/resume', authenticateToken, requireAdmin, async (re
 
 app.post('/api/admin/contest/stop', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    await stopGlobalMarketSimulation();
+    await stopContest();
     res.json({ 
       success: true, 
       message: 'Contest stopped'
@@ -1193,17 +1533,18 @@ app.post('/api/admin/contest/stop', authenticateToken, requireAdmin, async (req,
 });
 
 app.get('/api/admin/contest/status', authenticateToken, requireAdmin, (req, res) => {
-  const safeState = {
-    isRunning: globalMarketState.isRunning,
-    isPaused: globalMarketState.isPaused,
-    startTime: globalMarketState.startTime,
-    currentTickIndex: globalMarketState.currentTickIndex,
-    totalTicks: globalMarketState.totalTicks,
-    speed: globalMarketState.speed,
-    contestId: globalMarketState.contestId,
-    symbols: globalMarketState.symbols
-  };
-  res.json(safeState);
+  res.json({
+    isRunning: contestState.isRunning,
+    isPaused: contestState.isPaused,
+    contestStartTime: contestState.contestStartTime,
+    adminStartTime: contestState.adminStartTime,
+    dataStartTime: contestState.dataStartTime,
+    currentDataTick: contestState.currentDataTick,
+    totalDataTicks: contestState.totalDataTicks,
+    speed: contestState.speed,
+    contestId: contestState.contestId,
+    symbols: contestState.symbols
+  });
 });
 
 app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req, res) => {
@@ -1213,10 +1554,11 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
       return res.status(400).json({ error: 'Speed must be between 0.5 and 10' });
     }
     
-    globalMarketState.speed = speed;
+    contestState.speed = speed;
     
-    if (globalMarketState.isRunning && globalMarketState.intervalId) {
-      clearInterval(globalMarketState.intervalId);
+    if (contestState.isRunning && contestState.intervalId) {
+      clearInterval(contestState.intervalId);
+      await startContest(); // This will restart with new speed
     }
     
     await saveContestState();
@@ -1233,51 +1575,149 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
-  connectedUsers.add(socket.id);
 
-  const elapsedTime = globalMarketState.startTime 
-    ? Date.now() - globalMarketState.startTime.getTime() 
-    : 0;
-    
-  socket.emit('market_state', {
-    isRunning: globalMarketState.isRunning,
-    isPaused: globalMarketState.isPaused,
-    currentTickIndex: globalMarketState.currentTickIndex,
-    totalTicks: globalMarketState.totalTicks,
-    elapsedTime,
-    progress: (globalMarketState.currentTickIndex / globalMarketState.totalTicks) * 100,
-    speed: globalMarketState.speed
+  // Send initial contest state
+  socket.emit('contest_state', {
+    isRunning: contestState.isRunning,
+    isPaused: contestState.isPaused,
+    currentDataTick: contestState.currentDataTick,
+    totalDataTicks: contestState.totalDataTicks,
+    contestStartTime: contestState.contestStartTime,
+    dataStartTime: contestState.dataStartTime,
+    progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
+    speed: contestState.speed,
+    contestId: contestState.contestId
   });
 
+  // Handle user authentication for personalized rooms
+  socket.on('authenticate', async (token) => {
+    try {
+      // Verify token and get user info
+      const { data: { user }, error } = await supabase.auth.getUser(token);
+      
+      if (!error && user) {
+        // Find user in database
+        let { data: userData } = await supabase
+          .from('users')
+          .select('*')
+          .eq('auth_id', user.id)
+          .single();
+        
+        if (!userData) {
+          const { data: emailData } = await supabase
+            .from('users')
+            .select('*')
+            .eq("Candidate's Email", user.email)
+            .single();
+          userData = emailData;
+        }
+        
+        if (userData) {
+          const userEmail = userData["Candidate's Email"];
+          
+          // Store user connection
+          connectedUsers.set(socket.id, {
+            email: userEmail,
+            name: userData["Candidate's Name"],
+            role: userData.role,
+            connectedAt: new Date().toISOString()
+          });
+          
+          userSockets.set(userEmail, socket.id);
+          
+          // Join user-specific room and contest room
+          socket.join(`user:${userEmail}`);
+          socket.join(`contest:${contestState.contestId}`);
+          
+          // Join admin room if admin
+          if (userData.role === 'admin') {
+            socket.join(`admin:${contestState.contestId}`);
+          }
+          
+          socket.emit('authenticated', {
+            success: true,
+            user: {
+              email: userEmail,
+              name: userData["Candidate's Name"],
+              role: userData.role
+            }
+          });
+          
+          console.log(`User authenticated: ${userEmail}`);
+        }
+      }
+    } catch (error) {
+      console.error('Socket authentication error:', error);
+      socket.emit('authenticated', { success: false, error: error.message });
+    }
+  });
+
+  // Handle symbol subscription (multiple symbols supported)
+  socket.on('subscribe_symbols', (symbols) => {
+    console.log(`${socket.id} subscribing to symbols: ${symbols.join(', ')}`);
+    
+    symbols.forEach(symbol => {
+      socket.join(`symbol:${symbol}`);
+      
+      // Send current contest data for this symbol
+      if (stockDataCache.has(symbol)) {
+        const contestData = getContestDataUpToTick(symbol);
+        socket.emit('contest_data', {
+          symbol,
+          data: contestData,
+          total: contestData.length,
+          currentContestTick: contestState.currentDataTick,
+          totalContestTicks: contestState.totalDataTicks,
+          contestStartTime: contestState.contestStartTime,
+          dataStartTime: contestState.dataStartTime
+        });
+      }
+    });
+  });
+
+  socket.on('unsubscribe_symbols', (symbols) => {
+    console.log(`${socket.id} unsubscribing from symbols: ${symbols.join(', ')}`);
+    symbols.forEach(symbol => {
+      socket.leave(`symbol:${symbol}`);
+    });
+  });
+
+  // Legacy support for single symbol subscription
   socket.on('join_symbol', async (symbol) => {
     console.log(`${socket.id} joining room: ${symbol}`);
-    
-    const rooms = Array.from(socket.rooms).filter(room => room !== socket.id);
-    rooms.forEach(room => socket.leave(room));
-    
-    socket.join(symbol);
+    socket.join(`symbol:${symbol}`);
     
     if (!stockDataCache.has(symbol)) {
       await loadStockData(symbol);
     }
 
-    const historicalData = getHistoricalDataUpToTick(symbol);
-    socket.emit('historical_data', {
+    // FIXED: Send complete contest data from start to current tick
+    const contestData = getContestDataUpToTick(symbol);
+    socket.emit('contest_data', {
       symbol,
-      data: historicalData.slice(-100),
-      total: historicalData.length,
-      currentMarketTick: globalMarketState.currentTickIndex
+      data: contestData,
+      total: contestData.length,
+      currentContestTick: contestState.currentDataTick,
+      totalContestTicks: contestState.totalDataTicks,
+      contestStartTime: contestState.contestStartTime,
+      dataStartTime: contestState.dataStartTime
     });
   });
 
   socket.on('leave_symbol', (symbol) => {
     console.log(`${socket.id} leaving room: ${symbol}`);
-    socket.leave(symbol);
+    socket.leave(`symbol:${symbol}`);
   });
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
-    connectedUsers.delete(socket.id);
+    
+    // Clean up user mappings
+    const userInfo = connectedUsers.get(socket.id);
+    if (userInfo) {
+      userSockets.delete(userInfo.email);
+      connectedUsers.delete(socket.id);
+    }
   });
 });
 
@@ -1285,7 +1725,7 @@ io.on('connection', (socket) => {
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down...');
-  await stopGlobalMarketSimulation();
+  await stopContest();
   server.close(() => {
     console.log('Server closed.');
     process.exit(0);
@@ -1297,11 +1737,12 @@ server.listen(PORT, async () => {
   console.log(`🚀 Trading Contest Server running on port ${PORT}`);
   console.log(`📊 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🔌 API endpoint: http://localhost:${PORT}/api`);
+  console.log(`\n📝 Login with your Supabase Auth credentials`);
   
   const resumed = await loadContestState();
   if (resumed) {
     console.log('📊 Found previous contest state, resuming...');
-    await startGlobalMarketSimulation();
+    await startContest();
   } else {
     console.log('⏸️  No active contest. Start one using admin API.');
   }

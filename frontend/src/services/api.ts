@@ -43,8 +43,22 @@ export const apiService = {
     return data;
   },
 
+  // NEW: Contest data endpoint for proper timeline
+  async getContestData(symbol: string, from = 0, to?: number) {
+    const url = to !== undefined 
+      ? `/contest-data/${symbol}?from=${from}&to=${to}`
+      : `/contest-data/${symbol}?from=${from}`;
+    const { data } = await api.get(url);
+    return data;
+  },
+
   async getCandlestick(symbol: string, interval = '1m') {
     const { data } = await api.get(`/candlestick/${symbol}?interval=${interval}`);
+    return data;
+  },
+
+  async getContestState() {
+    const { data } = await api.get('/contest/state');
     return data;
   },
 
@@ -61,6 +75,13 @@ export const apiService = {
 
   async getTrades(page = 1, limit = 50) {
     const { data } = await api.get(`/trades?page=${page}&limit=${limit}`);
+    return data;
+  },
+
+  // NEW: Short positions endpoint
+  async getShortPositions(activeOnly = false) {
+    const url = activeOnly ? '/shorts?active=true' : '/shorts';
+    const { data } = await api.get(url);
     return data;
   },
 
