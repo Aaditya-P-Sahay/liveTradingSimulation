@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3002/api';
 
 // Create axios instance with interceptor
 const api = axios.create({
@@ -43,7 +43,7 @@ export const apiService = {
     return data;
   },
 
-  // NEW: Contest data endpoint for proper timeline
+  // ENHANCED: Contest data endpoint for Time 0 support
   async getContestData(symbol: string, from = 0, to?: number) {
     const url = to !== undefined 
       ? `/contest-data/${symbol}?from=${from}&to=${to}`
@@ -62,8 +62,12 @@ export const apiService = {
     return data;
   },
 
-  // Trading (Protected)
-  async placeTrade(trade: { symbol: string; order_type: string; quantity: number }) {
+  // ENHANCED: Trading (Protected)
+  async placeTrade(trade: { 
+    symbol: string; 
+    order_type: 'buy' | 'sell' | 'short_sell' | 'buy_to_cover'; 
+    quantity: number;
+  }) {
     const { data } = await api.post('/trade', trade);
     return data;
   },
@@ -78,7 +82,7 @@ export const apiService = {
     return data;
   },
 
-  // NEW: Short positions endpoint
+  // ENHANCED: Short positions endpoint
   async getShortPositions(activeOnly = false) {
     const url = activeOnly ? '/shorts?active=true' : '/shorts';
     const { data } = await api.get(url);
@@ -87,6 +91,37 @@ export const apiService = {
 
   async getLeaderboard(limit = 100) {
     const { data } = await api.get(`/leaderboard?limit=${limit}`);
+    return data;
+  },
+
+  // ENHANCED: Admin endpoints
+  async startContest() {
+    const { data } = await api.post('/admin/contest/start');
+    return data;
+  },
+
+  async pauseContest() {
+    const { data } = await api.post('/admin/contest/pause');
+    return data;
+  },
+
+  async resumeContest() {
+    const { data } = await api.post('/admin/contest/resume');
+    return data;
+  },
+
+  async stopContest() {
+    const { data } = await api.post('/admin/contest/stop');
+    return data;
+  },
+
+  async getAdminStatus() {
+    const { data } = await api.get('/admin/contest/status');
+    return data;
+  },
+
+  async setContestSpeed(speed: number) {
+    const { data } = await api.post('/admin/contest/speed', { speed });
     return data;
   },
 
