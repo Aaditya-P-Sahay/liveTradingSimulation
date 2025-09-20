@@ -7,11 +7,15 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import { spawn } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-// Load environment variables
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 dotenv.config();
 
-// Validate required environment variables
 const requiredEnvVars = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY'];
 const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
@@ -30,7 +34,6 @@ console.log(`🔗 Supabase URL: ${process.env.SUPABASE_URL}`);
 const app = express();
 const server = createServer(app);
 
-// Configure Socket.IO with multi-room support
 const io = new Server(server, {
   cors: {
     origin: ["http://localhost:5174", "http://localhost:3000", "http://localhost:5173", process.env.FRONTEND_URL],
@@ -45,7 +48,6 @@ const io = new Server(server, {
   allowEIO3: true
 });
 
-// Dual Supabase clients - USER CLIENT (anon key) and ADMIN CLIENT (service role)
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
@@ -62,7 +64,6 @@ const supabaseAdmin = createClient(
   }
 );
 
-// Middleware
 app.use(helmet());
 app.use(compression());
 app.use(cors({
@@ -71,80 +72,247 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ==================== CONTEST STATE MANAGEMENT ====================
+// ==================== CONTEST STATE ====================
 const contestState = {
   isRunning: false,
   isPaused: false,
   contestId: null,
-  
-  // Timeline management - CRITICAL for "Time 0" requirement
-  contestStartTime: null,     // Time 0 - when contest actually starts
-  dataStartTime: null,        // First tick timestamp in data
-  adminStartTime: null,       // When admin clicked start
-  
-  // Data management
-  currentDataTick: 0,         // Current position in dataset (shared across all users)
-  totalDataTicks: 0,          // Total ticks in dataset
-  contestDurationTicks: 3600, // Contest length in ticks
-  speed: 2,                   // Playback speed multiplier
-  
-  // Data and state
+  contestStartTime: null,
+  marketStartTime: null,
+  adminStartTime: null,
+  currentDataTick: 0,
+  totalDataTicks: 0,
+  contestDurationTicks: 3600,
+  speed: 2,
   symbols: [],
   intervalId: null,
-  maxDuration: 60 * 60 * 1000, // 1 hour maximum
+  maxDuration: 60 * 60 * 1000,
   contestEndTime: null
 };
 
-// In-memory data stores
-const stockDataCache = new Map();      // symbol -> array of tick data
-const connectedUsers = new Map();      // socketId -> userInfo
-const userSockets = new Map();         // userEmail -> socketId
-const portfolioCache = new Map();      // userEmail -> portfolio
+const stockDataCache = new Map();
+const connectedUsers = new Map();
+const userSockets = new Map();
+const portfolioCache = new Map();
 const leaderboardCache = [];
+const symbolRooms = new Map();
+const userSymbolSubscriptions = new Map();
+const candlestickCache = new Map();
 
-// WebSocket room management for multi-stock tracking
-const symbolRooms = new Map();         // symbol -> Set of socketIds
-const userSymbolSubscriptions = new Map(); // socketId -> Set of symbols
+// ==================== PYTHON TIMESTAMP PARSER INTEGRATION ====================
 
-// ==================== UTILITY FUNCTIONS ====================
-
-function normalizeTimestamp(timestamp) {
-  if (!timestamp) return new Date().toISOString();
-  
-  if (timestamp.includes(':') && !timestamp.includes('T')) {
-    const [minutes, seconds] = timestamp.split(':');
-    const [sec, ms] = seconds.split('.');
+/**
+ * Call Python timestamp parser exactly like your working Python code
+ */
+async function parseTimestampWithPython(timestamp) {
+  return new Promise((resolve, reject) => {
+    const pythonScript = path.join(__dirname, 'timestamp_parser.py');
+    const python = spawn('python', [pythonScript]);
     
-    const marketStart = new Date();
-    marketStart.setHours(9, 15, 0, 0);
-    marketStart.setMinutes(marketStart.getMinutes() + parseInt(minutes));
-    marketStart.setSeconds(parseInt(sec));
-    marketStart.setMilliseconds(parseInt(ms || 0) * 100);
+    let output = '';
+    let error = '';
     
-    return marketStart.toISOString();
+    python.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    python.stderr.on('data', (data) => {
+      error += data.toString();
+    });
+    
+    python.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`Python script error: ${error}`);
+        // Fallback to current time
+        resolve(Math.floor(Date.now() / 1000));
+        return;
+      }
+      
+      try {
+        const result = JSON.parse(output.trim());
+        resolve(result);
+      } catch (parseError) {
+        console.error(`Error parsing Python output: ${parseError}`);
+        resolve(Math.floor(Date.now() / 1000));
+      }
+    });
+    
+    // Send timestamp to Python script
+    python.stdin.write(JSON.stringify(timestamp));
+    python.stdin.end();
+  });
+}
+
+/**
+ * Batch parse timestamps with Python for efficiency
+ */
+async function parseTimestampsBatchWithPython(timestamps) {
+  return new Promise((resolve, reject) => {
+    const pythonScript = path.join(__dirname, 'timestamp_parser.py');
+    const python = spawn('python', [pythonScript]);
+    
+    let output = '';
+    let error = '';
+    
+    python.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    python.stderr.on('data', (data) => {
+      error += data.toString();
+    });
+    
+    python.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`Python batch script error: ${error}`);
+        // Fallback to current time for all
+        resolve(timestamps.map(() => Math.floor(Date.now() / 1000)));
+        return;
+      }
+      
+      try {
+        const results = JSON.parse(output.trim());
+        resolve(results);
+      } catch (parseError) {
+        console.error(`Error parsing Python batch output: ${parseError}`);
+        resolve(timestamps.map(() => Math.floor(Date.now() / 1000)));
+      }
+    });
+    
+    // Send timestamps to Python script
+    python.stdin.write(JSON.stringify(timestamps));
+    python.stdin.end();
+  });
+}
+
+// ==================== TIMESTAMP FUNCTIONS USING PYTHON ====================
+
+async function parseMarketTimestamp(timestamp) {
+  if (!timestamp) {
+    console.warn('Empty timestamp, using current time');
+    return Math.floor(Date.now() / 1000);
   }
   
-  return timestamp;
+  try {
+    console.log(`🐍 Using Python to parse timestamp: "${timestamp}"`);
+    const result = await parseTimestampWithPython(timestamp);
+    console.log(`✅ Python parsed "${timestamp}" -> ${result} (${new Date(result * 1000).toISOString()})`);
+    return result;
+  } catch (error) {
+    console.error(`❌ Python timestamp parsing failed for "${timestamp}":`, error);
+    return Math.floor(Date.now() / 1000);
+  }
+}
+
+async function getAbsoluteTimeFromTick(tickTimestamp) {
+  try {
+    const timestamp = await parseMarketTimestamp(tickTimestamp);
+    const date = new Date(timestamp * 1000);
+    
+    if (isNaN(date.getTime())) {
+      console.error(`❌ Invalid date from timestamp: "${tickTimestamp}"`);
+      return new Date();
+    }
+    
+    return date;
+  } catch (error) {
+    console.error(`❌ Error in getAbsoluteTimeFromTick for "${tickTimestamp}":`, error);
+    return new Date();
+  }
 }
 
 function getCurrentPrice(symbol) {
   const data = stockDataCache.get(symbol);
   if (!data || data.length === 0) return null;
-  
   const tickIndex = Math.min(contestState.currentDataTick, data.length - 1);
   return data[tickIndex]?.last_traded_price || null;
 }
 
-function getContestDataFromTimeZero(symbol, endTick = null) {
+function getTicksFromTimeZero(symbol, endTick = null) {
   const data = stockDataCache.get(symbol);
   if (!data || data.length === 0) return [];
-  
   const toTick = endTick !== null ? 
     Math.min(endTick, data.length - 1) : 
     Math.min(contestState.currentDataTick, data.length - 1);
-  
-  // IMPORTANT: Always return data from tick 0 (Time 0) to current
   return data.slice(0, Math.max(0, toTick + 1));
+}
+
+// ==================== CANDLE AGGREGATION WITH PYTHON TIMESTAMPS ====================
+
+async function aggregateTicksToCandles(ticks, intervalSeconds = 30) {
+  if (!ticks || ticks.length === 0) return [];
+  
+  console.log(`🕯️ PYTHON SOLUTION: Aggregating ${ticks.length} ticks using Python timestamp parser`);
+  
+  try {
+    // Extract all timestamps for batch parsing
+    const timestamps = ticks.map(tick => tick.timestamp);
+    
+    console.log(`🐍 Batch parsing ${timestamps.length} timestamps with Python...`);
+    const parsedTimestamps = await parseTimestampsBatchWithPython(timestamps);
+    
+    console.log(`✅ Python batch parsed ${parsedTimestamps.length} timestamps`);
+    
+    // Create ticks with parsed timestamps
+    const ticksWithParsedTime = ticks.map((tick, index) => ({
+      ...tick,
+      parsedTimestamp: parsedTimestamps[index]
+    }));
+    
+    // Sort by parsed timestamp
+    const sortedTicks = ticksWithParsedTime.sort((a, b) => a.parsedTimestamp - b.parsedTimestamp);
+    
+    const candleMap = new Map();
+    
+    sortedTicks.forEach((tick, index) => {
+      try {
+        const tickTime = tick.parsedTimestamp;
+        const bucketTime = Math.floor(tickTime / intervalSeconds) * intervalSeconds;
+        
+        const price = parseFloat(tick.last_traded_price) || 0;
+        const volume = parseInt(tick.volume_traded) || 0;
+        
+        if (price <= 0) {
+          console.warn(`⚠️ Invalid price for tick ${index}: ${price}`);
+          return;
+        }
+        
+        if (!candleMap.has(bucketTime)) {
+          candleMap.set(bucketTime, {
+            time: bucketTime,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: volume,
+            tickCount: 1
+          });
+        } else {
+          const candle = candleMap.get(bucketTime);
+          candle.high = Math.max(candle.high, price);
+          candle.low = Math.min(candle.low, price);
+          candle.close = price;
+          candle.volume += volume;
+          candle.tickCount++;
+        }
+      } catch (error) {
+        console.error(`❌ Error processing tick ${index}:`, error);
+      }
+    });
+    
+    const candles = Array.from(candleMap.values()).sort((a, b) => a.time - b.time);
+    
+    console.log(`✅ PYTHON SOLUTION: Created ${candles.length} candles using Python timestamp parsing`);
+    if (candles.length > 0) {
+      console.log(`   First: ${new Date(candles[0].time * 1000).toISOString()}`);
+      console.log(`   Last: ${new Date(candles[candles.length - 1].time * 1000).toISOString()}`);
+    }
+    
+    return candles;
+  } catch (error) {
+    console.error(`❌ Error in Python candle aggregation:`, error);
+    return [];
+  }
 }
 
 // ==================== AUTHENTICATION MIDDLEWARE ====================
@@ -158,7 +326,6 @@ async function authenticateToken(req, res, next) {
       return res.status(401).json({ error: 'Access token required' });
     }
 
-    // Check for test token first (for development)
     try {
       const decoded = JSON.parse(Buffer.from(token, 'base64').toString());
       if (decoded.test && decoded.exp > Date.now()) {
@@ -178,7 +345,6 @@ async function authenticateToken(req, res, next) {
       // Not a test token, continue with normal auth
     }
 
-    // Normal Supabase auth
     const { data: { user }, error } = await supabase.auth.getUser(token);
     
     if (error || !user) {
@@ -186,14 +352,12 @@ async function authenticateToken(req, res, next) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    // Try both auth_id lookup and email lookup for existing users
     let { data: userData, error: userError } = await supabaseAdmin
       .from('users')
       .select('*')
       .eq('auth_id', user.id)
       .single();
 
-    // If not found by auth_id, try email (for existing users)
     if (userError && userError.code === 'PGRST116') {
       const { data: emailData, error: emailError } = await supabaseAdmin
         .from('users')
@@ -202,7 +366,6 @@ async function authenticateToken(req, res, next) {
         .single();
       
       if (emailData && !emailError) {
-        // Update the user record with auth_id for future lookups
         await supabaseAdmin
           .from('users')
           .update({ auth_id: user.id })
@@ -281,7 +444,6 @@ async function updatePortfolioValues(userEmail) {
     const portfolio = await getOrCreatePortfolio(userEmail);
     if (!portfolio) return null;
 
-    // Calculate long positions value
     let longMarketValue = 0;
     let longUnrealizedPnl = 0;
 
@@ -293,7 +455,6 @@ async function updatePortfolioValues(userEmail) {
         longMarketValue += positionValue;
         longUnrealizedPnl += (currentPrice - position.avg_price) * position.quantity;
         
-        // Update holdings with current values
         holdings[symbol] = {
           ...position,
           current_price: currentPrice,
@@ -303,7 +464,6 @@ async function updatePortfolioValues(userEmail) {
       }
     }
 
-    // Calculate short positions value
     const { data: shortPositions } = await supabaseAdmin
       .from('short_positions')
       .select('*')
@@ -319,10 +479,8 @@ async function updatePortfolioValues(userEmail) {
         if (currentPrice) {
           const positionValue = currentPrice * short.quantity;
           shortMarketValue += positionValue;
-          // For short positions: profit when price goes down
           shortUnrealizedPnl += (short.avg_short_price - currentPrice) * short.quantity;
           
-          // Update short position
           await supabaseAdmin
             .from('short_positions')
             .update({
@@ -335,7 +493,6 @@ async function updatePortfolioValues(userEmail) {
       }
     }
 
-    // Total wealth calculation: Cash + Long Market Value + All Unrealized P&L
     const totalUnrealizedPnl = longUnrealizedPnl + shortUnrealizedPnl;
     const totalWealth = portfolio.cash_balance + longMarketValue + totalUnrealizedPnl;
     const totalPnl = totalUnrealizedPnl + (portfolio.realized_pnl || 0);
@@ -359,7 +516,6 @@ async function updatePortfolioValues(userEmail) {
 
     portfolioCache.set(userEmail, updatedPortfolio);
     
-    // Send portfolio update to user's socket
     const socketId = userSockets.get(userEmail);
     if (socketId) {
       io.to(`user:${userEmail}`).emit('portfolio_update', updatedPortfolio);
@@ -372,12 +528,10 @@ async function updatePortfolioValues(userEmail) {
   }
 }
 
-// ENHANCED SHORT SELLING FUNCTIONS
 async function openShortPosition(userEmail, symbol, companyName, quantity, price) {
   try {
     const totalAmount = quantity * price;
     
-    // Create short position record
     const { data: shortPosition, error } = await supabaseAdmin
       .from('short_positions')
       .insert({
@@ -396,13 +550,12 @@ async function openShortPosition(userEmail, symbol, companyName, quantity, price
 
     if (error) throw error;
 
-    // Add cash from short sale to portfolio
     const portfolio = await getOrCreatePortfolio(userEmail);
     await supabaseAdmin
       .from('portfolio')
       .update({
         cash_balance: portfolio.cash_balance + totalAmount,
-        realized_pnl: (portfolio.realized_pnl || 0) // Cash from shorting is not realized PnL yet
+        realized_pnl: (portfolio.realized_pnl || 0)
       })
       .eq('user_email', userEmail);
 
@@ -415,7 +568,6 @@ async function openShortPosition(userEmail, symbol, companyName, quantity, price
 
 async function closeShortPosition(userEmail, symbol, quantity, price) {
   try {
-    // Get active short positions for this symbol (FIFO)
     const { data: shortPositions } = await supabaseAdmin
       .from('short_positions')
       .select('*')
@@ -437,7 +589,6 @@ async function closeShortPosition(userEmail, symbol, quantity, price) {
       
       const quantityToCover = Math.min(remainingQuantity, position.quantity);
       const cost = quantityToCover * price;
-      // Short P&L: profit when price goes down
       const pnl = (position.avg_short_price - price) * quantityToCover;
       
       totalCost += cost;
@@ -445,7 +596,6 @@ async function closeShortPosition(userEmail, symbol, quantity, price) {
       remainingQuantity -= quantityToCover;
       
       if (quantityToCover === position.quantity) {
-        // Close entire position
         await supabaseAdmin
           .from('short_positions')
           .update({ 
@@ -455,7 +605,6 @@ async function closeShortPosition(userEmail, symbol, quantity, price) {
           })
           .eq('id', position.id);
       } else {
-        // Partially close position
         const newQuantity = position.quantity - quantityToCover;
         await supabaseAdmin
           .from('short_positions')
@@ -471,7 +620,6 @@ async function closeShortPosition(userEmail, symbol, quantity, price) {
       throw new Error(`Insufficient short positions. Missing ${remainingQuantity} shares`);
     }
 
-    // Update portfolio: reduce cash (cost to buy back), add realized P&L
     const portfolio = await getOrCreatePortfolio(userEmail);
     await supabaseAdmin
       .from('portfolio')
@@ -488,10 +636,8 @@ async function closeShortPosition(userEmail, symbol, quantity, price) {
   }
 }
 
-// ENHANCED TRADING EXECUTION
 async function executeTrade(userEmail, symbol, companyName, orderType, quantity, price) {
   try {
-    // Check if contest is running
     if (!contestState.isRunning || contestState.isPaused) {
       throw new Error('Trading is only allowed when contest is running');
     }
@@ -564,7 +710,6 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await closeShortPosition(userEmail, symbol, quantity, price);
     }
     
-    // Record the trade
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
       .insert({
@@ -591,18 +736,15 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
   }
 }
 
-// AUTO SQUARE-OFF MECHANISM
 async function autoSquareOffAllPositions() {
   try {
     console.log('🔄 Starting auto square-off for all positions...');
     
-    // Get all active short positions
     const { data: shortPositions } = await supabaseAdmin
       .from('short_positions')
       .select('*')
       .eq('is_active', true);
 
-    // Square off all short positions
     if (shortPositions && shortPositions.length > 0) {
       console.log(`📉 Square off ${shortPositions.length} short positions...`);
       
@@ -612,7 +754,6 @@ async function autoSquareOffAllPositions() {
           if (currentPrice) {
             await closeShortPosition(short.user_email, short.symbol, short.quantity, currentPrice);
             
-            // Record auto square-off trade
             await supabaseAdmin
               .from('trades')
               .insert({
@@ -632,7 +773,6 @@ async function autoSquareOffAllPositions() {
       }
     }
 
-    // Update all portfolio values one final time
     const { data: portfolios } = await supabaseAdmin
       .from('portfolio')
       .select('user_email');
@@ -681,7 +821,6 @@ async function updateLeaderboard() {
     leaderboardCache.length = 0;
     leaderboardCache.push(...leaderboard);
 
-    // Broadcast leaderboard update to all contest participants
     io.to(`contest:${contestState.contestId}`).emit('leaderboard_update', leaderboard.slice(0, 20));
 
     return leaderboard;
@@ -717,7 +856,6 @@ async function loadStockData(symbol) {
         from += batchSize;
         hasMore = data.length === batchSize;
         
-        // Log progress every 5 batches
         if ((from / batchSize) % 5 === 0) {
           console.log(`  Loaded batch: ${data.length} rows (total so far: ${allData.length})`);
         }
@@ -731,9 +869,15 @@ async function loadStockData(symbol) {
       return [];
     }
 
+    // DEBUG: Log sample timestamps
+    console.log(`🔍 PYTHON DEBUG: Sample timestamps for ${symbol}:`);
+    for (let i = 0; i < Math.min(3, allData.length); i++) {
+      const sample = allData[i];
+      console.log(`   Row ${i}: timestamp="${sample.timestamp}" (type: ${typeof sample.timestamp})`);
+    }
+
     const processedData = allData.map(row => ({
       ...row,
-      normalized_timestamp: normalizeTimestamp(row.timestamp),
       last_traded_price: parseFloat(row.last_traded_price) || 0,
       volume_traded: parseInt(row.volume_traded) || 0,
       high_price: parseFloat(row.high_price) || 0,
@@ -741,12 +885,11 @@ async function loadStockData(symbol) {
       close_price: parseFloat(row.close_price) || 0,
       open_price: parseFloat(row.open_price) || 0,
       average_traded_price: parseFloat(row.average_traded_price) || 0
-    })).sort((a, b) => new Date(a.normalized_timestamp) - new Date(b.normalized_timestamp));
+    })).sort((a, b) => a.unique_id - b.unique_id);
 
     stockDataCache.set(symbol, processedData);
-    console.log(`✅ Loaded ${processedData.length} total data points for ${symbol}`);
+    console.log(`✅ Loaded ${processedData.length} total ticks for ${symbol}`);
     
-    // Update contest total ticks to minimum across all symbols
     if (contestState.totalDataTicks === 0) {
       contestState.totalDataTicks = processedData.length;
     } else {
@@ -897,7 +1040,7 @@ async function saveContestResults() {
   }
 }
 
-// ==================== CONTEST MANAGEMENT WITH TIME 0 SUPPORT ====================
+// ==================== CONTEST MANAGEMENT WITH PYTHON TIMESTAMPS ====================
 
 async function startContest() {
   if (contestState.isRunning && !contestState.isPaused) {
@@ -910,7 +1053,6 @@ async function startContest() {
     console.log('📊 Resuming contest');
     await saveContestState();
     
-    // Broadcast resume event
     io.to(`contest:${contestState.contestId}`).emit('contest_resumed', {
       message: 'Contest has been resumed',
       contestState: {
@@ -926,18 +1068,19 @@ async function startContest() {
   }
 
   try {
-    // Initialize new contest
+    console.log('🚀 PYTHON SOLUTION: Starting contest with Python timestamp parsing...');
+    
     contestState.isRunning = true;
     contestState.isPaused = false;
     contestState.contestId = crypto.randomUUID();
     contestState.adminStartTime = new Date();
-    contestState.contestStartTime = new Date(); // This is "Time 0"
-    contestState.currentDataTick = 0; // Start from tick 0
+    contestState.contestStartTime = new Date();
+    contestState.marketStartTime = new Date(contestState.contestStartTime);
+    contestState.currentDataTick = 0;
     contestState.contestEndTime = new Date(Date.now() + contestState.maxDuration);
     
     console.log(`🚀 CONTEST STARTING - Time 0: ${contestState.contestStartTime.toISOString()}`);
     
-    // Load symbols and data
     const symbols = await getAvailableSymbols();
     if (symbols.length === 0) {
       throw new Error('No symbols found in database');
@@ -953,46 +1096,39 @@ async function startContest() {
       console.log(`Progress: ${loadedSymbols}/${symbols.length} symbols loaded`);
     }
     
-    // Set data start time to first tick
-    if (symbols.length > 0 && stockDataCache.has(symbols[0])) {
-      const firstData = stockDataCache.get(symbols[0])[0];
-      contestState.dataStartTime = new Date(firstData.normalized_timestamp);
-    }
-    
     console.log(`📈 Contest Configuration:`);
     console.log(`   - Contest ID: ${contestState.contestId}`);
     console.log(`   - Time 0 (Start): ${contestState.contestStartTime.toISOString()}`);
-    console.log(`   - Data Start: ${contestState.dataStartTime?.toISOString()}`);
     console.log(`   - Total Symbols: ${symbols.length}`);
     console.log(`   - Total Ticks: ${contestState.totalDataTicks}`);
     console.log(`   - Speed: ${contestState.speed}x`);
-    console.log(`   - Expected Duration: ${(contestState.totalDataTicks * 500 / contestState.speed) / 60000} minutes`);
     
     await saveContestState();
     
-    // Create WebSocket rooms for each symbol
     symbols.forEach(symbol => {
       if (!symbolRooms.has(symbol)) {
         symbolRooms.set(symbol, new Set());
       }
     });
     
-    // Broadcast contest start to all connected users
     io.emit('contest_started', {
       message: 'Contest has started!',
       contestId: contestState.contestId,
       contestStartTime: contestState.contestStartTime,
-      dataStartTime: contestState.dataStartTime,
+      marketStartTime: contestState.marketStartTime,
       symbols: contestState.symbols,
       totalTicks: contestState.totalDataTicks,
       speed: contestState.speed
     });
     
-    // ENHANCED: Start the contest simulation loop with detailed math logging
+    console.log('🔥 PYTHON SOLUTION: Starting contest simulation loop...');
+    
     contestState.intervalId = setInterval(async () => {
-      if (contestState.isPaused) return;
+      if (contestState.isPaused) {
+        console.log('⏸️ Contest paused, skipping tick');
+        return;
+      }
       
-      // Check time limit
       const elapsedTime = Date.now() - contestState.adminStartTime.getTime();
       if (elapsedTime >= contestState.maxDuration) {
         console.log('⏰ Contest duration reached (1 hour). Stopping contest.');
@@ -1000,21 +1136,16 @@ async function startContest() {
         return;
       }
       
-      // Check data exhaustion
       if (contestState.currentDataTick >= contestState.totalDataTicks - 1) {
         console.log('📊 All market data exhausted. Stopping contest.');
         await stopContest();
         return;
       }
       
-      // Advance to next tick
       contestState.currentDataTick++;
       
-      console.log(`\n🔢 === TICK ${contestState.currentDataTick} MATH BREAKDOWN ===`);
-      console.log(`⏰ Real Time: ${new Date().toLocaleTimeString()}`);
-      console.log(`📊 Progress: ${contestState.currentDataTick}/${contestState.totalDataTicks} (${((contestState.currentDataTick / contestState.totalDataTicks) * 100).toFixed(2)}%)`);
+      console.log(`🔢 TICK ${contestState.currentDataTick}/${contestState.totalDataTicks} (${((contestState.currentDataTick / contestState.totalDataTicks) * 100).toFixed(2)}%) - ${new Date().toLocaleTimeString()}`);
       
-      // Broadcast current tick data to symbol rooms
       const tickData = {};
       const symbolUpdates = [];
       
@@ -1025,28 +1156,36 @@ async function startContest() {
           const price = currentTick.last_traded_price;
           tickData[symbol] = price;
           
-          console.log(`   📈 ${symbol}: ₹${price.toFixed(2)} (Volume: ${currentTick.volume_traded || 0})`);
+          console.log(`   📈 ${symbol}: ₹${price.toFixed(2)}`);
           
-          // Send to symbol-specific rooms
-          const symbolUpdate = {
+          // PYTHON SOLUTION: Safe timestamp conversion using Python
+          let absoluteTimeISO;
+          try {
+            const absoluteTime = await getAbsoluteTimeFromTick(currentTick.timestamp);
+            absoluteTimeISO = absoluteTime.toISOString();
+          } catch (error) {
+            console.error(`❌ Error converting timestamp for ${symbol}:`, error);
+            absoluteTimeISO = new Date().toISOString(); // Fallback
+          }
+          
+          const tickUpdate = {
             symbol,
             data: currentTick,
             tickIndex: contestState.currentDataTick,
             totalTicks: contestState.totalDataTicks,
             progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
             contestStartTime: contestState.contestStartTime,
-            dataStartTime: contestState.dataStartTime
+            marketStartTime: contestState.marketStartTime,
+            absoluteTime: absoluteTimeISO
           };
           
-          symbolUpdates.push(symbolUpdate);
-          io.to(`symbol:${symbol}`).emit('symbol_tick', symbolUpdate);
+          symbolUpdates.push(tickUpdate);
+          io.to(`symbol:${symbol}`).emit('symbol_tick', tickUpdate);
         }
       }
       
-      console.log(`🚀 Broadcasting to ${symbolUpdates.length} symbols`);
-      console.log(`=== END TICK ${contestState.currentDataTick} ===\n`);
+      console.log(`🚀 Streamed ${symbolUpdates.length} updates to clients`);
       
-      // Broadcast market-wide tick to contest room
       io.to(`contest:${contestState.contestId}`).emit('market_tick', {
         tickIndex: contestState.currentDataTick,
         totalTicks: contestState.totalDataTicks,
@@ -1054,29 +1193,28 @@ async function startContest() {
         prices: tickData,
         progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
         contestStartTime: contestState.contestStartTime,
-        dataStartTime: contestState.dataStartTime,
+        marketStartTime: contestState.marketStartTime,
         elapsedTime: elapsedTime
       });
       
-      // Update portfolios periodically (every 10 ticks)
       if (contestState.currentDataTick % 10 === 0) {
-        // Update user portfolios
         for (const userEmail of portfolioCache.keys()) {
           await updatePortfolioValues(userEmail);
         }
       }
       
-      // Update leaderboard and save state periodically (every 100 ticks)
       if (contestState.currentDataTick % 100 === 0) {
         await saveContestState();
         await updateLeaderboard();
       }
       
-    }, 500 / contestState.speed); // Adjust interval based on speed
+    }, 500 / contestState.speed);
+    
+    console.log(`✅ PYTHON SOLUTION: Contest loop started with interval ${500 / contestState.speed}ms`);
     
     return { 
       success: true, 
-      message: 'Contest started successfully',
+      message: 'Contest started successfully with Python timestamp parsing',
       contestId: contestState.contestId,
       contestStartTime: contestState.contestStartTime,
       symbols: contestState.symbols,
@@ -1098,7 +1236,6 @@ async function stopContest() {
   }
 
   try {
-    // Stop the simulation loop
     if (contestState.intervalId) {
       clearInterval(contestState.intervalId);
       contestState.intervalId = null;
@@ -1106,23 +1243,16 @@ async function stopContest() {
 
     console.log('🔄 Stopping contest and performing auto square-off...');
     
-    // Auto square-off all positions
     await autoSquareOffAllPositions();
-    
-    // Update final leaderboard
     const finalResults = await updateLeaderboard();
-    
-    // Save contest results
     await saveContestResults();
     
-    // Update contest state
     contestState.isRunning = false;
     contestState.isPaused = false;
     contestState.contestEndTime = new Date();
     
     await saveContestState();
     
-    // Broadcast contest end to all participants
     io.emit('contest_ended', {
       message: 'Contest has ended - All positions auto squared-off',
       contestId: contestState.contestId,
@@ -1146,56 +1276,6 @@ async function stopContest() {
     console.error('Error stopping contest:', error);
     return { success: false, message: error.message };
   }
-}
-
-function groupIntoCandlesticks(data, interval) {
-  if (!data || data.length === 0) return [];
-  
-  const intervalMs = getIntervalMs(interval);
-  const candlesticks = [];
-  let currentCandle = null;
-  
-  data.forEach(tick => {
-    const tickTime = new Date(tick.normalized_timestamp || tick.timestamp).getTime();
-    const candleTime = Math.floor(tickTime / intervalMs) * intervalMs;
-    
-    if (!currentCandle || currentCandle.time !== candleTime) {
-      if (currentCandle) {
-        candlesticks.push(currentCandle);
-      }
-      currentCandle = {
-        time: new Date(candleTime).toISOString(),
-        open: tick.last_traded_price,
-        high: tick.last_traded_price,
-        low: tick.last_traded_price,
-        close: tick.last_traded_price,
-        volume: tick.volume_traded
-      };
-    } else {
-      currentCandle.high = Math.max(currentCandle.high, tick.last_traded_price);
-      currentCandle.low = Math.min(currentCandle.low, tick.last_traded_price);
-      currentCandle.close = tick.last_traded_price;
-      currentCandle.volume += tick.volume_traded;
-    }
-  });
-
-  if (currentCandle) {
-    candlesticks.push(currentCandle);
-  }
-
-  return candlesticks;
-}
-
-function getIntervalMs(interval) {
-  const intervals = {
-    '1m': 60 * 1000,
-    '5m': 5 * 60 * 1000,
-    '15m': 15 * 60 * 1000,
-    '30m': 30 * 60 * 1000,
-    '1h': 60 * 60 * 1000,
-    '1d': 24 * 60 * 60 * 1000
-  };
-  return intervals[interval] || intervals['1m'];
 }
 
 // ==================== REST API ROUTES ====================
@@ -1299,14 +1379,12 @@ app.post('/api/auth/login', async (req, res) => {
 
     console.log('✅ Supabase Auth successful for:', email);
 
-    // Try both auth_id and email lookup
     let { data: userData, error: userError } = await supabaseAdmin
       .from('users')
       .select('*')
       .eq('auth_id', data.user.id)
       .single();
 
-    // If not found by auth_id, try email lookup for existing users
     if (userError && userError.code === 'PGRST116') {
       const { data: emailData, error: emailError } = await supabaseAdmin
         .from('users')
@@ -1315,7 +1393,6 @@ app.post('/api/auth/login', async (req, res) => {
         .single();
       
       if (emailData && !emailError) {
-        // Update user with auth_id for future lookups
         await supabaseAdmin
           .from('users')
           .update({ auth_id: data.user.id })
@@ -1374,7 +1451,6 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   }
 });
 
-// TEMPORARY TEST ENDPOINT - REMOVE IN PRODUCTION
 app.post('/api/test/create-test-user', async (req, res) => {
   try {
     const testEmail = `test_${Date.now()}@example.com`;
@@ -1420,11 +1496,10 @@ app.get('/api/symbols', async (req, res) => {
   }
 });
 
-// ENHANCED: Contest data endpoint - CRITICAL for Time 0 requirement
 app.get('/api/contest-data/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
-    const { from, to } = req.query;
+    const { from, to, interval } = req.query;
     
     let data = stockDataCache.get(symbol);
     if (!data) {
@@ -1434,8 +1509,10 @@ app.get('/api/contest-data/:symbol', async (req, res) => {
     const fromTick = parseInt(from) || 0;
     const toTick = parseInt(to) || contestState.currentDataTick;
     
-    // ALWAYS return data from Time 0 (tick 0) - this ensures users joining mid-contest see full timeline
-    const contestData = data.slice(fromTick, Math.min(Math.max(toTick + 1, 0), data.length));
+    const ticksFromTimeZero = data.slice(fromTick, Math.min(Math.max(toTick + 1, 0), data.length));
+    
+    const intervalSeconds = parseInt(interval) || 30;
+    const aggregatedCandles = await aggregateTicksToCandles(ticksFromTimeZero, intervalSeconds);
     
     res.json({
       symbol,
@@ -1443,14 +1520,18 @@ app.get('/api/contest-data/:symbol', async (req, res) => {
       toTick,
       currentContestTick: contestState.currentDataTick,
       totalContestTicks: contestState.totalDataTicks,
-      data: contestData,
-      count: contestData.length,
-      contestStartTime: contestState.contestStartTime, // Time 0
-      dataStartTime: contestState.dataStartTime,
+      ticks: ticksFromTimeZero,
+      ticksCount: ticksFromTimeZero.length,
+      candles: aggregatedCandles,
+      candlesCount: aggregatedCandles.length,
+      intervalSeconds,
+      contestStartTime: contestState.contestStartTime,
+      marketStartTime: contestState.marketStartTime,
       contestActive: contestState.isRunning,
       contestPaused: contestState.isPaused
     });
   } catch (error) {
+    console.error('Error in contest-data endpoint:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1467,8 +1548,7 @@ app.get('/api/history/:symbol', async (req, res) => {
       data = await loadStockData(symbol);
     }
 
-    // Return data from Time 0 to current tick for contest participants
-    const availableData = getContestDataFromTimeZero(symbol);
+    const availableData = getTicksFromTimeZero(symbol);
     const totalRecords = availableData.length;
     const totalPages = Math.ceil(totalRecords / limit);
     const paginatedData = availableData.slice(offset, offset + limit);
@@ -1495,17 +1575,31 @@ app.get('/api/history/:symbol', async (req, res) => {
 app.get('/api/candlestick/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
-    const interval = req.query.interval || '1m';
+    const interval = req.query.interval || '30s';
     
-    const data = getContestDataFromTimeZero(symbol);
-    const candlesticks = groupIntoCandlesticks(data, interval);
+    const intervalMap = {
+      '30s': 30,
+      '1m': 60,
+      '5m': 300,
+      '15m': 900,
+      '30m': 1800,
+      '1h': 3600
+    };
+    const intervalSeconds = intervalMap[interval] || 30;
+    
+    const ticks = getTicksFromTimeZero(symbol);
+    const candlesticks = await aggregateTicksToCandles(ticks, intervalSeconds);
     
     res.json({
       symbol,
       interval,
+      intervalSeconds,
       currentContestTick: contestState.currentDataTick,
       contestStartTime: contestState.contestStartTime,
-      data: candlesticks
+      marketStartTime: contestState.marketStartTime,
+      data: candlesticks,
+      totalCandles: candlesticks.length,
+      totalTicks: ticks.length
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1520,9 +1614,9 @@ app.get('/api/contest/state', (req, res) => {
   res.json({
     isRunning: contestState.isRunning,
     isPaused: contestState.isPaused,
-    contestStartTime: contestState.contestStartTime, // Time 0
+    contestStartTime: contestState.contestStartTime,
     adminStartTime: contestState.adminStartTime,
-    dataStartTime: contestState.dataStartTime,
+    marketStartTime: contestState.marketStartTime,
     currentDataTick: contestState.currentDataTick,
     totalDataTicks: contestState.totalDataTicks,
     elapsedTime,
@@ -1766,7 +1860,7 @@ app.get('/api/admin/contest/status', authenticateToken, requireAdmin, (req, res)
     isPaused: contestState.isPaused,
     contestStartTime: contestState.contestStartTime,
     adminStartTime: contestState.adminStartTime,
-    dataStartTime: contestState.dataStartTime,
+    marketStartTime: contestState.marketStartTime,
     currentDataTick: contestState.currentDataTick,
     totalDataTicks: contestState.totalDataTicks,
     elapsedTime,
@@ -1790,11 +1884,9 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
     
     contestState.speed = speed;
     
-    // Restart the interval with new speed if contest is running
     if (contestState.isRunning && contestState.intervalId) {
       clearInterval(contestState.intervalId);
       
-      // Restart simulation loop with new speed
       contestState.intervalId = setInterval(async () => {
         if (contestState.isPaused) return;
         
@@ -1813,7 +1905,6 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
         
         contestState.currentDataTick++;
         
-        // Broadcast updates (same logic as in startContest)
         const tickData = {};
         for (const symbol of contestState.symbols) {
           const data = stockDataCache.get(symbol);
@@ -1829,7 +1920,7 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
               totalTicks: contestState.totalDataTicks,
               progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
               contestStartTime: contestState.contestStartTime,
-              dataStartTime: contestState.dataStartTime
+              marketStartTime: contestState.marketStartTime
             });
           }
         }
@@ -1841,7 +1932,7 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
           prices: tickData,
           progress: (contestState.currentDataTick / contestState.totalDataTicks) * 100,
           contestStartTime: contestState.contestStartTime,
-          dataStartTime: contestState.dataStartTime,
+          marketStartTime: contestState.marketStartTime,
           elapsedTime: elapsedTime
         });
         
@@ -1861,7 +1952,6 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
     
     await saveContestState();
     
-    // Broadcast speed change to all users
     io.to(`contest:${contestState.contestId}`).emit('speed_changed', {
       newSpeed: speed,
       message: `Contest speed changed to ${speed}x`
@@ -1877,33 +1967,29 @@ app.post('/api/admin/contest/speed', authenticateToken, requireAdmin, async (req
   }
 });
 
-// ==================== ENHANCED WEBSOCKET HANDLERS ====================
+// ==================== WEBSOCKET HANDLERS ====================
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // Send initial contest state
   socket.emit('contest_state', {
     isRunning: contestState.isRunning,
     isPaused: contestState.isPaused,
     currentDataTick: contestState.currentDataTick,
     totalDataTicks: contestState.totalDataTicks,
     contestStartTime: contestState.contestStartTime,
-    dataStartTime: contestState.dataStartTime,
+    marketStartTime: contestState.marketStartTime,
     progress: contestState.totalDataTicks > 0 ? (contestState.currentDataTick / contestState.totalDataTicks) * 100 : 0,
     speed: contestState.speed,
     contestId: contestState.contestId,
     symbols: contestState.symbols
   });
 
-  // Handle user authentication for personalized rooms
   socket.on('authenticate', async (token) => {
     try {
-      // Verify token and get user info
       const { data: { user }, error } = await supabase.auth.getUser(token);
       
       if (!error && user) {
-        // Find user in database
         let { data: userData } = await supabaseAdmin
           .from('users')
           .select('*')
@@ -1922,7 +2008,6 @@ io.on('connection', (socket) => {
         if (userData) {
           const userEmail = userData["Candidate's Email"];
           
-          // Store user connection
           connectedUsers.set(socket.id, {
             email: userEmail,
             name: userData["Candidate's Name"],
@@ -1932,11 +2017,9 @@ io.on('connection', (socket) => {
           
           userSockets.set(userEmail, socket.id);
           
-          // Join user-specific room and contest room
           socket.join(`user:${userEmail}`);
           socket.join(`contest:${contestState.contestId}`);
           
-          // Join admin room if admin
           if (userData.role === 'admin') {
             socket.join(`admin:${contestState.contestId}`);
           }
@@ -1959,44 +2042,41 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ENHANCED: Multi-symbol subscription support
-  socket.on('subscribe_symbols', (symbols) => {
+  socket.on('subscribe_symbols', async (symbols) => {
     console.log(`${socket.id} subscribing to symbols: ${symbols.join(', ')}`);
     
-    // Initialize user's subscription tracking
     if (!userSymbolSubscriptions.has(socket.id)) {
       userSymbolSubscriptions.set(socket.id, new Set());
     }
     
     const userSubscriptions = userSymbolSubscriptions.get(socket.id);
     
-    symbols.forEach(symbol => {
-      // Add to user's subscriptions
+    for (const symbol of symbols) {
       userSubscriptions.add(symbol);
-      
-      // Join symbol room
       socket.join(`symbol:${symbol}`);
       
-      // Initialize symbol room if needed
       if (!symbolRooms.has(symbol)) {
         symbolRooms.set(symbol, new Set());
       }
       symbolRooms.get(symbol).add(socket.id);
       
-      // Send current contest data for this symbol (FROM TIME 0)
       if (stockDataCache.has(symbol)) {
-        const contestData = getContestDataFromTimeZero(symbol);
+        const contestTicks = getTicksFromTimeZero(symbol);
+        const aggregatedCandles = await aggregateTicksToCandles(contestTicks, 30);
+        
         socket.emit('contest_data', {
           symbol,
-          data: contestData,
-          total: contestData.length,
+          ticks: contestTicks,
+          candles: aggregatedCandles,
+          total: contestTicks.length,
+          candlesTotal: aggregatedCandles.length,
           currentContestTick: contestState.currentDataTick,
           totalContestTicks: contestState.totalDataTicks,
-          contestStartTime: contestState.contestStartTime, // Time 0
-          dataStartTime: contestState.dataStartTime
+          contestStartTime: contestState.contestStartTime,
+          marketStartTime: contestState.marketStartTime
         });
       }
-    });
+    }
     
     console.log(`✅ ${socket.id} subscribed to ${symbols.length} symbols`);
   });
@@ -2010,7 +2090,6 @@ io.on('connection', (socket) => {
         userSubscriptions.delete(symbol);
         socket.leave(`symbol:${symbol}`);
         
-        // Remove from symbol room
         if (symbolRooms.has(symbol)) {
           symbolRooms.get(symbol).delete(socket.id);
         }
@@ -2018,47 +2097,45 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Legacy support for single symbol subscription
   socket.on('join_symbol', async (symbol) => {
     console.log(`${socket.id} joining room: ${symbol}`);
     socket.join(`symbol:${symbol}`);
     
-    // Initialize symbol room
     if (!symbolRooms.has(symbol)) {
       symbolRooms.set(symbol, new Set());
     }
     symbolRooms.get(symbol).add(socket.id);
     
-    // Load data if not cached
     if (!stockDataCache.has(symbol)) {
       await loadStockData(symbol);
     }
 
-    // Send complete contest data from Time 0 to current tick
-    const contestData = getContestDataFromTimeZero(symbol);
+    const contestTicks = getTicksFromTimeZero(symbol);
+    const aggregatedCandles = await aggregateTicksToCandles(contestTicks, 30);
+    
     socket.emit('contest_data', {
       symbol,
-      data: contestData,
-      total: contestData.length,
+      ticks: contestTicks,
+      candles: aggregatedCandles,
+      total: contestTicks.length,
+      candlesTotal: aggregatedCandles.length,
       currentContestTick: contestState.currentDataTick,
       totalContestTicks: contestState.totalDataTicks,
-      contestStartTime: contestState.contestStartTime, // Time 0
-      dataStartTime: contestState.dataStartTime
+      contestStartTime: contestState.contestStartTime,
+      marketStartTime: contestState.marketStartTime
     });
     
-    console.log(`📈 Sent ${contestData.length} data points for ${symbol} from Time 0 to current`);
+    console.log(`📈 Sent ${contestTicks.length} ticks and ${aggregatedCandles.length} candles for ${symbol} from Time 0 to current`);
   });
 
   socket.on('leave_symbol', (symbol) => {
     console.log(`${socket.id} leaving room: ${symbol}`);
     socket.leave(`symbol:${symbol}`);
     
-    // Remove from symbol room tracking
     if (symbolRooms.has(symbol)) {
       symbolRooms.get(symbol).delete(socket.id);
     }
     
-    // Remove from user subscriptions
     const userSubscriptions = userSymbolSubscriptions.get(socket.id);
     if (userSubscriptions) {
       userSubscriptions.delete(symbol);
@@ -2068,14 +2145,12 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     
-    // Clean up user mappings
     const userInfo = connectedUsers.get(socket.id);
     if (userInfo) {
       userSockets.delete(userInfo.email);
       connectedUsers.delete(socket.id);
     }
     
-    // Clean up symbol room subscriptions
     const userSubscriptions = userSymbolSubscriptions.get(socket.id);
     if (userSubscriptions) {
       userSubscriptions.forEach(symbol => {
@@ -2093,7 +2168,6 @@ io.on('connection', (socket) => {
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
   
-  // Auto square-off if contest is running
   if (contestState.isRunning) {
     console.log('🔄 Auto square-off on shutdown...');
     await autoSquareOffAllPositions();
@@ -2106,22 +2180,20 @@ process.on('SIGTERM', async () => {
   });
 });
 
-const PORT = process.env.PORT || 3002; // CHANGED FROM 3001 TO 3002
+const PORT = process.env.PORT || 3002;
 server.listen(PORT, async () => {
   console.log(`🚀 Trading Contest Server running on port ${PORT}`);
   console.log(`📊 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🔌 API endpoint: http://localhost:${PORT}/api`);
   console.log(`\n📝 Login with your Supabase Auth credentials`);
   
-  // Try to resume any previous contest
   const resumed = await loadContestState();
   if (resumed && contestState.isRunning) {
     console.log('📊 Found previous contest state, resuming...');
-    // Reload data and restart simulation
     for (const symbol of contestState.symbols) {
       await loadStockData(symbol);
     }
-    await startContest(); // This will handle resuming properly
+    await startContest();
   } else {
     console.log('⏸️  No active contest. Start one using admin API.');
   }
@@ -2129,12 +2201,10 @@ server.listen(PORT, async () => {
   await updateLeaderboard();
   console.log('✅ System initialization complete');
   
-  console.log(`\n🎯 CONTEST SYSTEM READY:`);
-  console.log(`   - Multi-stock support: ${contestState.symbols.length} symbols`);
-  console.log(`   - Short selling: ✅ Enabled`);
-  console.log(`   - Auto square-off: ✅ Enabled`);
-  console.log(`   - Timeline sync: ✅ Time 0 support`);
-  console.log(`   - WebSocket rooms: ✅ Per-symbol rooms`);
-  console.log(`   - Database access: ✅ Dual client setup`);
-  console.log(`   - Port: ${PORT} (Changed from 3001)`);
+  console.log(`\n🐍 PYTHON TIMESTAMP SOLUTION ACTIVE:`);
+  console.log(`   - ✅ Python script: timestamp_parser.py`);
+  console.log(`   - ✅ Exact pd.to_datetime() logic`);
+  console.log(`   - ✅ Batch processing for efficiency`);
+  console.log(`   - ✅ Timeline continuity fixed`);
+  console.log(`   - Port: ${PORT}`);
 });

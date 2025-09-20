@@ -1,133 +1,198 @@
-import axios from 'axios';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3002';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3002/api';
+interface ApiResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
 
-// Create axios instance with interceptor
-const api = axios.create({
-  baseURL: API_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
-});
+interface ContestDataResponse {
+  symbol: string;
+  fromTick: number;
+  toTick: number;
+  currentContestTick: number;
+  totalContestTicks: number;
+  ticks: any[];
+  ticksCount: number;
+  candles: any[];
+  candlesCount: number;
+  intervalSeconds: number;
+  contestStartTime: string;
+  marketStartTime: string;
+  contestActive: boolean;
+  contestPaused: boolean;
+}
 
-// Add auth token to all requests
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('auth_token');
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
+class ApiService {
+  private authToken: string | null = null;
+
+  setAuthToken(token: string | null) {
+    this.authToken = token;
   }
-  return config;
-});
 
-// Handle auth errors
-api.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem('auth_token');
-      window.location.href = '/login';
+  private async request<T = any>(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<T> {
+    const url = `${API_URL}${endpoint}`;
+    
+    const defaultHeaders: HeadersInit = {
+      'Content-Type': 'application/json',
+    };
+
+    if (this.authToken) {
+      defaultHeaders.Authorization = `Bearer ${this.authToken}`;
     }
-    return Promise.reject(error);
+
+    const config: RequestInit = {
+      ...options,
+      headers: {
+        ...defaultHeaders,
+        ...options.headers,
+      },
+    };
+
+    try {
+      const response = await fetch(url, config);
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error(`API Request failed: ${endpoint}`, error);
+      throw error;
+    }
   }
-);
 
-export const apiService = {
-  // Market Data (Public)
-  async getSymbols() {
-    const { data } = await api.get('/symbols');
-    return data;
-  },
+  // Auth methods
+  async login(email: string, password: string) {
+    return this.request('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+  }
 
-  async getHistory(symbol: string, page = 1, limit = 100) {
-    const { data } = await api.get(`/history/${symbol}?page=${page}&limit=${limit}`);
-    return data;
-  },
+  async signup(email: string, password: string, full_name: string) {
+    return this.request('/api/auth/signup', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, full_name }),
+    });
+  }
 
-  // ENHANCED: Contest data endpoint for Time 0 support
-  async getContestData(symbol: string, from = 0, to?: number) {
-    const url = to !== undefined 
-      ? `/contest-data/${symbol}?from=${from}&to=${to}`
-      : `/contest-data/${symbol}?from=${from}`;
-    const { data } = await api.get(url);
-    return data;
-  },
+  async logout() {
+    return this.request('/api/auth/logout', {
+      method: 'POST',
+    });
+  }
 
-  async getCandlestick(symbol: string, interval = '1m') {
-    const { data } = await api.get(`/candlestick/${symbol}?interval=${interval}`);
-    return data;
-  },
+  async getMe() {
+    return this.request('/api/auth/me');
+  }
+
+  // Market data methods
+  async getSymbols(): Promise<string[]> {
+    return this.request('/api/symbols');
+  }
+
+  async getContestData(
+    symbol: string,
+    from?: number,
+    to?: number,
+    interval?: number
+  ): Promise<ContestDataResponse> {
+    const params = new URLSearchParams();
+    if (from !== undefined) params.append('from', from.toString());
+    if (to !== undefined) params.append('to', to.toString());
+    if (interval !== undefined) params.append('interval', interval.toString());
+    
+    const query = params.toString() ? `?${params.toString()}` : '';
+    return this.request(`/api/contest-data/${symbol}${query}`);
+  }
+
+  async getHistory(symbol: string, page = 1, limit = 1000) {
+    return this.request(`/api/history/${symbol}?page=${page}&limit=${limit}`);
+  }
+
+  async getCandlestick(symbol: string, interval = '30s') {
+    return this.request(`/api/candlestick/${symbol}?interval=${interval}`);
+  }
 
   async getContestState() {
-    const { data } = await api.get('/contest/state');
-    return data;
-  },
+    return this.request('/api/contest/state');
+  }
 
-  // ENHANCED: Trading (Protected)
-  async placeTrade(trade: { 
-    symbol: string; 
-    order_type: 'buy' | 'sell' | 'short_sell' | 'buy_to_cover'; 
-    quantity: number;
-  }) {
-    const { data } = await api.post('/trade', trade);
-    return data;
-  },
+  // Trading methods
+  async executeTrade(symbol: string, order_type: string, quantity: number) {
+    return this.request('/api/trade', {
+      method: 'POST',
+      body: JSON.stringify({ symbol, order_type, quantity }),
+    });
+  }
 
   async getPortfolio() {
-    const { data } = await api.get('/portfolio');
-    return data;
-  },
+    return this.request('/api/portfolio');
+  }
 
   async getTrades(page = 1, limit = 50) {
-    const { data } = await api.get(`/trades?page=${page}&limit=${limit}`);
-    return data;
-  },
+    return this.request(`/api/trades?page=${page}&limit=${limit}`);
+  }
 
-  // ENHANCED: Short positions endpoint
-  async getShortPositions(activeOnly = false) {
-    const url = activeOnly ? '/shorts?active=true' : '/shorts';
-    const { data } = await api.get(url);
-    return data;
-  },
+  async getShorts(activeOnly = true) {
+    return this.request(`/api/shorts?active=${activeOnly}`);
+  }
 
   async getLeaderboard(limit = 100) {
-    const { data } = await api.get(`/leaderboard?limit=${limit}`);
-    return data;
-  },
+    return this.request(`/api/leaderboard?limit=${limit}`);
+  }
 
-  // ENHANCED: Admin endpoints
+  // Admin methods
   async startContest() {
-    const { data } = await api.post('/admin/contest/start');
-    return data;
-  },
+    return this.request('/api/admin/contest/start', {
+      method: 'POST',
+    });
+  }
 
   async pauseContest() {
-    const { data } = await api.post('/admin/contest/pause');
-    return data;
-  },
+    return this.request('/api/admin/contest/pause', {
+      method: 'POST',
+    });
+  }
 
   async resumeContest() {
-    const { data } = await api.post('/admin/contest/resume');
-    return data;
-  },
+    return this.request('/api/admin/contest/resume', {
+      method: 'POST',
+    });
+  }
 
   async stopContest() {
-    const { data } = await api.post('/admin/contest/stop');
-    return data;
-  },
+    return this.request('/api/admin/contest/stop', {
+      method: 'POST',
+    });
+  }
 
   async getAdminStatus() {
-    const { data } = await api.get('/admin/contest/status');
-    return data;
-  },
+    return this.request('/api/admin/contest/status');
+  }
 
   async setContestSpeed(speed: number) {
-    const { data } = await api.post('/admin/contest/speed', { speed });
-    return data;
-  },
-
-  // Health check
-  async getHealth() {
-    const { data } = await api.get('/health');
-    return data;
+    return this.request('/api/admin/contest/speed', {
+      method: 'POST',
+      body: JSON.stringify({ speed }),
+    });
   }
-};
+
+  async createTestUser() {
+    return this.request('/api/test/create-test-user', {
+      method: 'POST',
+    });
+  }
+
+  async health() {
+    return this.request('/api/health');
+  }
+}
+
+export const apiService = new ApiService();

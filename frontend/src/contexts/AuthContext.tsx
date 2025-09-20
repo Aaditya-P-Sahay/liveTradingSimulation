@@ -1,105 +1,110 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import axios from 'axios';
+import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { apiService } from '../services/api';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3002';
 
 interface User {
   email: string;
-  name?: string;
-  role?: string;
+  name: string;
+  role: string;
 }
 
 interface AuthContextType {
   user: User | null;
   token: string | null;
-  loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (email: string, password: string, name: string) => Promise<void>;
   logout: () => void;
+  isLoading: boolean;
+  isAuthenticated: boolean;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+
+interface AuthProviderProps {
+  children: ReactNode;
+}
+
+export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const savedToken = localStorage.getItem('auth_token');
-    if (savedToken) {
-      setToken(savedToken);
-      checkAuth(savedToken);
-    } else {
-      setLoading(false);
+    const storedToken = localStorage.getItem('token');
+    const storedUser = localStorage.getItem('user');
+    
+    if (storedToken && storedUser) {
+      try {
+        setToken(storedToken);
+        setUser(JSON.parse(storedUser));
+        apiService.setAuthToken(storedToken);
+      } catch (error) {
+        console.error('Error parsing stored user data:', error);
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+      }
     }
+    setIsLoading(false);
   }, []);
 
-  const checkAuth = async (authToken: string) => {
-    try {
-      const { data } = await axios.get(`${API_URL}/auth/me`, {
-        headers: { Authorization: `Bearer ${authToken}` }
-      });
-      
-      if (data.success) {
-        setUser({
-          email: data.user.email,
-          name: data.user.name,
-          role: data.user.role
-        });
-      }
-    } catch (error) {
-      console.error('Auth check failed:', error);
-      localStorage.removeItem('auth_token');
-      setToken(null);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const login = async (email: string, password: string) => {
-    const { data } = await axios.post(`${API_URL}/auth/login`, { email, password });
-    
-    if (data.success && data.token) {
-      localStorage.setItem('auth_token', data.token);
-      setToken(data.token);
-      setUser({
-        email: data.user.email,
-        name: data.user.name,
-        role: data.user.role
+    try {
+      const response = await fetch(`${API_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ email, password }),
       });
-    }
-  };
 
-  const signup = async (email: string, password: string, name: string) => {
-    const { data } = await axios.post(`${API_URL}/auth/signup`, {
-      email,
-      password,
-      full_name: name
-    });
-    
-    if (data.success && data.token) {
-      localStorage.setItem('auth_token', data.token);
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Login failed');
+      }
+
+      const data = await response.json();
+      
+      setUser(data.user);
       setToken(data.token);
-      setUser({ email, name, role: 'user' });
+      
+      localStorage.setItem('token', data.token);
+      localStorage.setItem('user', JSON.stringify(data.user));
+      
+      apiService.setAuthToken(data.token);
+    } catch (error) {
+      console.error('Login error:', error);
+      throw error;
     }
   };
 
   const logout = () => {
-    localStorage.removeItem('auth_token');
-    setToken(null);
     setUser(null);
+    setToken(null);
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    apiService.setAuthToken(null);
+  };
+
+  const value = {
+    user,
+    token,
+    login,
+    logout,
+    isLoading,
+    isAuthenticated: !!user && !!token,
   };
 
   return (
-    <AuthContext.Provider value={{ user, token, loading, login, signup, logout }}>
+    <AuthContext.Provider value={value}>
       {children}
     </AuthContext.Provider>
   );
-};
-
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) throw new Error('useAuth must be used within AuthProvider');
-  return context;
 };

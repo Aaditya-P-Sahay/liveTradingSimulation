@@ -9,12 +9,12 @@ export default defineConfig({
     host: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:3002',
+        target: 'http://localhost:3002', // FIXED: Changed from 3001 to 3002
         changeOrigin: true,
         secure: false,
       },
       '/socket.io': {
-        target: 'http://localhost:3002',
+        target: 'http://localhost:3002', // FIXED: Changed from 3001 to 3002
         changeOrigin: true,
         ws: true,
       }
