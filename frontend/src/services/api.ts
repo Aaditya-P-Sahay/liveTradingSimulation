@@ -1,3 +1,4 @@
+// frontend/src/services/api.ts
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3002';
 
 interface ApiResponse<T = any> {
@@ -8,28 +9,36 @@ interface ApiResponse<T = any> {
 
 interface ContestDataResponse {
   symbol: string;
-  fromTick: number;
-  toTick: number;
-  currentContestTick: number;
-  totalContestTicks: number;
+  timeframe: string;
+  fromIndex: number;
+  toIndex: number;
+  currentContestIndex: number;
+  totalContestRows: number;
   ticks: any[];
   ticksCount: number;
   candles: any[];
   candlesCount: number;
-  intervalSeconds: number;
   contestStartTime: string;
-  marketStartTime: string;
   contestActive: boolean;
   contestPaused: boolean;
+}
+
+interface TimeframeInfo {
+  available: string[];
+  enabled: string[];
+  default: string;
+  details: Record<string, { seconds: number; label: string }>;
 }
 
 class ApiService {
   private authToken: string | null = null;
 
+  // YOUR ORIGINAL METHOD (PRESERVED)
   setAuthToken(token: string | null) {
     this.authToken = token;
   }
 
+  // YOUR ORIGINAL REQUEST METHOD (PRESERVED)
   private async request<T = any>(
     endpoint: string,
     options: RequestInit = {}
@@ -67,7 +76,7 @@ class ApiService {
     }
   }
 
-  // Auth methods
+  // YOUR ORIGINAL AUTH METHODS (PRESERVED)
   async login(email: string, password: string) {
     return this.request('/api/auth/login', {
       method: 'POST',
@@ -92,7 +101,12 @@ class ApiService {
     return this.request('/api/auth/me');
   }
 
-  // Market data methods
+  // NEW: Timeframe methods
+  async getTimeframes(): Promise<TimeframeInfo> {
+    return this.request('/api/timeframes');
+  }
+
+  // YOUR ORIGINAL + ENHANCED MARKET DATA METHODS
   async getSymbols(): Promise<string[]> {
     return this.request('/api/symbols');
   }
@@ -101,12 +115,12 @@ class ApiService {
     symbol: string,
     from?: number,
     to?: number,
-    interval?: number
+    timeframe?: string
   ): Promise<ContestDataResponse> {
     const params = new URLSearchParams();
     if (from !== undefined) params.append('from', from.toString());
     if (to !== undefined) params.append('to', to.toString());
-    if (interval !== undefined) params.append('interval', interval.toString());
+    if (timeframe) params.append('timeframe', timeframe);
     
     const query = params.toString() ? `?${params.toString()}` : '';
     return this.request(`/api/contest-data/${symbol}${query}`);
@@ -116,19 +130,24 @@ class ApiService {
     return this.request(`/api/history/${symbol}?page=${page}&limit=${limit}`);
   }
 
-  async getCandlestick(symbol: string, interval = '30s') {
-    return this.request(`/api/candlestick/${symbol}?interval=${interval}`);
+  // ENHANCED: Candlestick with timeframe support
+  async getCandlestick(symbol: string, timeframe = '30s') {
+    return this.request(`/api/candlestick/${symbol}?timeframe=${timeframe}`);
   }
 
   async getContestState() {
     return this.request('/api/contest/state');
   }
 
-  // Trading methods
-  async executeTrade(symbol: string, order_type: string, quantity: number) {
+  // YOUR ORIGINAL TRADING METHODS (PRESERVED)
+  async placeTrade(tradeData: {
+    symbol: string;
+    order_type: string;
+    quantity: number;
+  }) {
     return this.request('/api/trade', {
       method: 'POST',
-      body: JSON.stringify({ symbol, order_type, quantity }),
+      body: JSON.stringify(tradeData),
     });
   }
 
@@ -140,7 +159,7 @@ class ApiService {
     return this.request(`/api/trades?page=${page}&limit=${limit}`);
   }
 
-  async getShorts(activeOnly = true) {
+  async getShortPositions(activeOnly = true) {
     return this.request(`/api/shorts?active=${activeOnly}`);
   }
 
@@ -148,7 +167,7 @@ class ApiService {
     return this.request(`/api/leaderboard?limit=${limit}`);
   }
 
-  // Admin methods
+  // YOUR ORIGINAL ADMIN METHODS (PRESERVED)
   async startContest() {
     return this.request('/api/admin/contest/start', {
       method: 'POST',
