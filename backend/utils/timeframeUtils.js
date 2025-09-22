@@ -1,7 +1,7 @@
 // backend/utils/timeframeUtils.js
 
 /**
- * Utility functions for handling multiple timeframes
+ * FIXED: Utility functions for handling multiple timeframes with proper math
  */
 
 export const TIMEFRAMES = {
@@ -18,7 +18,7 @@ export const TIMEFRAMES = {
 export const DEFAULT_TIMEFRAME = '30s';
 
 /**
- * Parse clean timestamp from database
+ * FIXED: Parse clean timestamp from database (millisecond precision)
  */
 export function parseCleanTimestamp(timestamp) {
   try {
@@ -27,7 +27,8 @@ export function parseCleanTimestamp(timestamp) {
       console.warn('Invalid timestamp:', timestamp);
       return Math.floor(Date.now() / 1000);
     }
-    return Math.floor(date.getTime() / 1000);
+    // FIXED: Return seconds with decimal precision for milliseconds
+    return date.getTime() / 1000;
   } catch (error) {
     console.error('Error parsing timestamp:', timestamp, error);
     return Math.floor(Date.now() / 1000);
@@ -35,7 +36,28 @@ export function parseCleanTimestamp(timestamp) {
 }
 
 /**
- * Aggregate ticks into candles for specified timeframe
+ * FIXED: Create universal time mapper for 5x speed compression
+ */
+export function createUniversalTimeMapper(marketDataDurationMs, contestDurationMs) {
+  const speedMultiplier = marketDataDurationMs / contestDurationMs; // 5x for 5hrs→1hr
+  
+  return {
+    speedMultiplier,
+    
+    // Convert market time to contest universal time
+    marketToUniversal: (marketTimeSeconds) => {
+      return marketTimeSeconds / speedMultiplier;
+    },
+    
+    // Convert contest universal time to market time
+    universalToMarket: (universalTimeSeconds) => {
+      return universalTimeSeconds * speedMultiplier;
+    }
+  };
+}
+
+/**
+ * FIXED: Aggregate ticks into candles with proper OHLC logic
  */
 export function aggregateTicksToCandles(ticks, timeframeKey = '30s') {
   if (!ticks || ticks.length === 0) return [];
@@ -49,9 +71,9 @@ export function aggregateTicksToCandles(ticks, timeframeKey = '30s') {
   const intervalSeconds = timeframe.seconds;
   const candleMap = new Map();
   
-  console.log(`🕯️ Aggregating ${ticks.length} ticks to ${timeframeKey} candles (${intervalSeconds}s intervals)`);
+  console.log(`🕯️ FIXED: Aggregating ${ticks.length} ticks to ${timeframeKey} candles (${intervalSeconds}s intervals)`);
   
-  // Sort ticks by timestamp to ensure proper order
+  // FIXED: Sort ticks by timestamp to ensure proper order
   const sortedTicks = [...ticks].sort((a, b) => {
     const timeA = parseCleanTimestamp(a.timestamp);
     const timeB = parseCleanTimestamp(b.timestamp);
@@ -61,6 +83,8 @@ export function aggregateTicksToCandles(ticks, timeframeKey = '30s') {
   sortedTicks.forEach((tick, index) => {
     try {
       const tickTime = parseCleanTimestamp(tick.timestamp);
+      
+      // FIXED: Proper bucket time calculation with decimal precision
       const bucketTime = Math.floor(tickTime / intervalSeconds) * intervalSeconds;
       
       const price = parseFloat(tick.last_traded_price) || 0;
@@ -76,9 +100,10 @@ export function aggregateTicksToCandles(ticks, timeframeKey = '30s') {
       }
       
       if (!candleMap.has(bucketTime)) {
+        // FIXED: Create new candle with proper OHLC initialization
         candleMap.set(bucketTime, {
           time: bucketTime,
-          open: open || price,
+          open: open,
           high: Math.max(high, price),
           low: Math.min(low, price),
           close: price,
@@ -87,6 +112,7 @@ export function aggregateTicksToCandles(ticks, timeframeKey = '30s') {
           symbol: tick.symbol
         });
       } else {
+        // FIXED: Update existing candle with proper OHLC accumulation
         const candle = candleMap.get(bucketTime);
         candle.high = Math.max(candle.high, high, price);
         candle.low = Math.min(candle.low, low, price);
@@ -101,13 +127,13 @@ export function aggregateTicksToCandles(ticks, timeframeKey = '30s') {
   
   const candles = Array.from(candleMap.values()).sort((a, b) => a.time - b.time);
   
-  console.log(`✅ Created ${candles.length} ${timeframeKey} candles from ${sortedTicks.length} ticks`);
+  console.log(`✅ FIXED: Created ${candles.length} ${timeframeKey} candles from ${sortedTicks.length} ticks`);
   
   return candles;
 }
 
 /**
- * Get timeframe in milliseconds
+ * FIXED: Get timeframe in milliseconds
  */
 export function getTimeframeMs(timeframeKey) {
   const timeframe = TIMEFRAMES[timeframeKey];
@@ -130,12 +156,21 @@ export function isValidTimeframe(timeframeKey) {
 }
 
 /**
- * Get candle bucket time for a given timestamp and timeframe
+ * FIXED: Get candle bucket time for a given timestamp and timeframe
  */
-export function getCandleBucketTime(timestamp, timeframeKey) {
+export function getCandleBucketTime(timestamp, timeframeKey, isUniversalTime = false) {
   const timeframe = TIMEFRAMES[timeframeKey];
   if (!timeframe) return null;
   
-  const tickTime = parseCleanTimestamp(timestamp);
-  return Math.floor(tickTime / timeframe.seconds) * timeframe.seconds;
+  let timeSeconds;
+  if (isUniversalTime) {
+    // Timestamp is already in universal time seconds
+    timeSeconds = timestamp;
+  } else {
+    // Parse timestamp string to seconds
+    timeSeconds = parseCleanTimestamp(timestamp);
+  }
+  
+  // FIXED: Proper bucket calculation
+  return Math.floor(timeSeconds / timeframe.seconds) * timeframe.seconds;
 }

@@ -1,4 +1,3 @@
-// frontend/src/components/charts/LiveStockChart.tsx
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, Time, UTCTimestamp } from 'lightweight-charts';
 import { useMarket } from '../../contexts/MarketContext';
@@ -15,61 +14,49 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Line'> | ISeriesApi<'Candlestick'> | null>(null);
-  const resizeObserverRef = useRef<ResizeObserver | null>(null);
   
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>('');
-  const { socket, isConnected, marketState, lastTickData } = useMarket();
+  const [candleCount, setCandleCount] = useState(0);
+  const [lastUpdateTime, setLastUpdateTime] = useState<number>(0);
+  const [isChartReady, setIsChartReady] = useState(false);
+  
+  const { socket, isConnected, marketState } = useMarket();
   const { selectedTimeframe, setSelectedTimeframe, getTimeframeLabel } = useTimeframes();
   
-  // Data management
-  const allCandlesRef = useRef<Map<string, any[]>>(new Map()); // timeframe -> candles[]
-  const subscribedRef = useRef<boolean>(false);
-  const currentSymbolRef = useRef<string>('');
-  const chartInitializedRef = useRef<boolean>(false);
-  const lastDataCountRef = useRef<number>(0);
+  // Store current candles
+  const currentCandlesRef = useRef<any[]>([]);
 
-  // Clean timestamp parsing (no Python needed!)
-  const parseCleanTimestamp = useCallback((timestamp: string): UTCTimestamp => {
-    try {
-      const date = new Date(timestamp);
-      if (isNaN(date.getTime())) {
-        console.warn('Invalid timestamp from backend:', timestamp);
-        return Math.floor(Date.now() / 1000) as UTCTimestamp;
-      }
-      return Math.floor(date.getTime() / 1000) as UTCTimestamp;
-    } catch (error) {
-      console.warn('❌ Error parsing clean timestamp:', timestamp, error);
-      return Math.floor(Date.now() / 1000) as UTCTimestamp;
-    }
-  }, []);
-
+  // Initialize chart with proper configuration
   const initializeChart = useCallback(() => {
     if (!chartContainerRef.current || chartRef.current) return;
 
-    console.log(`🎯 Initializing ${chartType} chart for ${symbol} with ${selectedTimeframe} timeframe`);
+    console.log(`🎯 Initializing ${chartType} chart for ${symbol} (${selectedTimeframe})`);
     
-    const container = chartContainerRef.current;
-    const rect = container.getBoundingClientRect();
-    const width = Math.max(rect.width || 800, 300);
-    const height = 500;
-
     try {
+      const container = chartContainerRef.current;
+      const rect = container.getBoundingClientRect();
+      
       const chart = createChart(container, {
-        width,
-        height,
+        width: Math.max(rect.width || 800, 400),
+        height: 500,
         layout: {
-          background: { color: '#1a1a1a' },
-          textColor: '#d1d4dc',
+          background: { color: '#000000' },
+          textColor: '#ffffff',
         },
         grid: {
-          vertLines: { color: '#2a2a2a' },
-          horzLines: { color: '#2a2a2a' },
+          vertLines: { color: '#1e1e1e' },
+          horzLines: { color: '#1e1e1e' },
+        },
+        crosshair: {
+          mode: 1,
+          vertLine: { color: '#758696', width: 1, style: 1 },
+          horzLine: { color: '#758696', width: 1, style: 1 },
         },
         timeScale: {
           timeVisible: true,
           secondsVisible: true,
-          borderColor: '#2a2a2a',
+          borderColor: '#2e2e2e',
           rightOffset: 12,
           barSpacing: 6,
           fixLeftEdge: false,
@@ -77,35 +64,8 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
           rightBarStaysOnScroll: true,
         },
         rightPriceScale: {
-          borderColor: '#2a2a2a',
-          scaleMargins: {
-            top: 0.1,
-            bottom: 0.1,
-          },
-        },
-        crosshair: {
-          mode: 1,
-          vertLine: {
-            color: '#758696',
-            width: 1,
-            style: 2,
-          },
-          horzLine: {
-            color: '#758696',
-            width: 1,
-            style: 2,
-          },
-        },
-        handleScroll: {
-          mouseWheel: true,
-          pressedMouseMove: true,
-          horzTouchDrag: true,
-          vertTouchDrag: true,
-        },
-        handleScale: {
-          axisPressedMouseMove: true,
-          mouseWheel: true,
-          pinch: true,
+          borderColor: '#2e2e2e',
+          scaleMargins: { top: 0.1, bottom: 0.1 },
         },
       });
 
@@ -113,7 +73,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
 
       if (chartType === 'line') {
         const lineSeries = chart.addLineSeries({
-          color: '#2962FF',
+          color: '#00ff88',
           lineWidth: 2,
           priceLineVisible: true,
           lastValueVisible: true,
@@ -122,191 +82,151 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         seriesRef.current = lineSeries;
       } else {
         const candlestickSeries = chart.addCandlestickSeries({
-          upColor: '#26a69a',
-          downColor: '#ef5350',
-          borderUpColor: '#26a69a',
-          borderDownColor: '#ef5350',
-          wickUpColor: '#26a69a',
-          wickDownColor: '#ef5350',
+          upColor: '#00ff88',
+          downColor: '#ff4444',
+          borderUpColor: '#00ff88',
+          borderDownColor: '#ff4444',
+          wickUpColor: '#00ff88',
+          wickDownColor: '#ff4444',
           priceLineVisible: true,
           lastValueVisible: true,
         });
         seriesRef.current = candlestickSeries;
       }
 
-      if (resizeObserverRef.current) {
-        resizeObserverRef.current.disconnect();
-      }
-      
-      resizeObserverRef.current = new ResizeObserver((entries) => {
+      // Handle resize
+      const resizeObserver = new ResizeObserver((entries) => {
         if (chartRef.current) {
           const entry = entries[0];
           if (entry) {
             const { width: newWidth, height: newHeight } = entry.contentRect;
             chartRef.current.applyOptions({ 
-              width: Math.max(newWidth, 300), 
+              width: Math.max(newWidth, 400), 
               height: Math.max(newHeight, 400) 
             });
           }
         }
       });
       
-      resizeObserverRef.current.observe(container);
+      resizeObserver.observe(container);
+      setIsChartReady(true);
       
-      chartInitializedRef.current = true;
-      console.log(`✅ ${chartType} chart initialized for ${symbol} (${selectedTimeframe})`);
+      console.log(`✅ Chart initialized for ${symbol} (${selectedTimeframe})`);
 
     } catch (error) {
       console.error('❌ Chart initialization error:', error);
       setError('Failed to initialize chart');
+      setIsChartReady(false);
     }
   }, [chartType, symbol, selectedTimeframe]);
 
-  const updateChartData = useCallback(() => {
-    if (!seriesRef.current) return;
-
-    const candles = allCandlesRef.current.get(selectedTimeframe) || [];
-    if (candles.length === 0) return;
-
-    console.log(`📊 Updating chart for ${symbol} (${selectedTimeframe}) with ${candles.length} candles`);
+  // Update chart data
+  const updateChartData = useCallback((candles: any[]) => {
+    if (!seriesRef.current || !isChartReady || !candles || candles.length === 0) {
+      return;
+    }
 
     try {
-      if (chartType === 'candlestick' && seriesRef.current) {
+      if (chartType === 'candlestick') {
         const formattedCandles = candles.map(candle => ({
           time: candle.time as UTCTimestamp,
-          open: candle.open,
-          high: candle.high,
-          low: candle.low,
-          close: candle.close,
+          open: Number(candle.open),
+          high: Number(candle.high),
+          low: Number(candle.low),
+          close: Number(candle.close),
         }));
         
         seriesRef.current.setData(formattedCandles);
         
-      } else if (chartType === 'line' && seriesRef.current) {
+      } else {
         const lineData = candles.map(candle => ({
           time: candle.time as UTCTimestamp,
-          value: candle.close,
+          value: Number(candle.close),
         }));
         
         seriesRef.current.setData(lineData);
       }
-      
-      // Auto-scroll to latest data
-      if (chartRef.current && candles.length > 1) {
-        requestAnimationFrame(() => {
-          try {
-            const timeScale = chartRef.current?.timeScale();
-            if (timeScale) {
-              const lastCandle = candles[candles.length - 1];
-              const visibleRange = timeScale.getVisibleRange();
-              
-              // Only auto-scroll if user is near the end
-              if (!visibleRange || (visibleRange.to as number) > (lastCandle.time - 300)) {
-                if (candles.length > 50) {
-                  const startTime = candles[Math.max(0, candles.length - 50)].time;
-                  timeScale.setVisibleRange({
-                    from: startTime as any,
-                    to: (lastCandle.time + 60) as any
-                  });
-                } else {
-                  timeScale.fitContent();
-                }
-              }
-            }
-          } catch (e) {
-            console.debug('Auto-scroll error:', e);
-          }
-        });
-      }
-      
+
+      setCandleCount(candles.length);
+      setLastUpdateTime(Date.now());
       setError('');
-      lastDataCountRef.current = candles.length;
+      
+      console.log(`📊 Chart updated: ${candles.length} candles for ${symbol} (${selectedTimeframe})`);
       
     } catch (error) {
       console.error('❌ Chart update error:', error);
       setError('Failed to update chart');
     }
-  }, [chartType, selectedTimeframe, symbol]);
+  }, [chartType, selectedTimeframe, symbol, isChartReady]);
 
   // Handle timeframe changes
   const handleTimeframeChange = useCallback((newTimeframe: string) => {
-    console.log(`🔄 Changing timeframe from ${selectedTimeframe} to ${newTimeframe} for ${symbol}`);
+    console.log(`🔄 Changing timeframe to ${newTimeframe} for ${symbol}`);
+    
+    // Clear current data
+    currentCandlesRef.current = [];
+    setCandleCount(0);
+    setLastUpdateTime(0);
+    
+    // Clear chart
+    if (seriesRef.current) {
+      seriesRef.current.setData([]);
+    }
+    
     setSelectedTimeframe(newTimeframe);
-    
-    // Update chart with data for new timeframe
-    setTimeout(() => {
-      updateChartData();
-    }, 100);
-  }, [selectedTimeframe, setSelectedTimeframe, updateChartData, symbol]);
+  }, [setSelectedTimeframe, symbol]);
 
-  // Initialize chart when type or timeframe changes
+  // Initialize chart when dependencies change
   useEffect(() => {
-    console.log(`🔄 Chart setup changed: ${chartType} / ${selectedTimeframe} for ${symbol}`);
-    
+    // Clean up existing chart
     if (chartRef.current) {
       try {
         chartRef.current.remove();
       } catch (e) {
-        console.debug('Chart cleanup error:', e);
+        console.debug('Chart cleanup:', e);
       }
       chartRef.current = null;
       seriesRef.current = null;
-      chartInitializedRef.current = false;
+      setIsChartReady(false);
     }
     
+    // Clear data
+    currentCandlesRef.current = [];
+    setCandleCount(0);
+    setLastUpdateTime(0);
+    setError('');
+    
+    // Initialize new chart
     const initTimeout = setTimeout(() => {
       initializeChart();
-      
-      const updateTimeout = setTimeout(() => {
-        updateChartData();
-      }, 100);
-      
-      return () => clearTimeout(updateTimeout);
-    }, 50);
+    }, 100);
     
     return () => clearTimeout(initTimeout);
-  }, [chartType, selectedTimeframe, initializeChart, updateChartData]);
+  }, [chartType, selectedTimeframe, initializeChart]);
 
-  // Load data and setup WebSocket subscriptions
+  // Setup WebSocket and load initial data
   useEffect(() => {
-    if (!symbol || !socket) return;
+    if (!symbol || !socket || !isChartReady) return;
 
     let mounted = true;
-    console.log(`🔄 Setting up data and subscriptions for ${symbol}`);
+    console.log(`🔄 Setting up progressive data for ${symbol} (${selectedTimeframe})`);
 
-    const loadData = async () => {
+    // Load initial data
+    const loadInitialData = async () => {
       try {
         setLoading(true);
-        setError('');
-        
-        console.log(`📊 Loading candlestick data for ${symbol} (${selectedTimeframe})...`);
         
         const response = await apiService.getCandlestick(symbol, selectedTimeframe);
         
-        if (response.data && response.data.length > 0 && mounted) {
-          console.log(`✅ Loaded ${response.data.length} candles for ${symbol} (${selectedTimeframe})`);
-          
-          // Store candles for current timeframe
-          allCandlesRef.current.set(selectedTimeframe, response.data);
-          
-          const waitForChart = () => {
-            if (chartInitializedRef.current && seriesRef.current) {
-              updateChartData();
-            } else if (mounted) {
-              setTimeout(waitForChart, 100);
-            }
-          };
-          waitForChart();
-          
-        } else if (mounted) {
-          console.log(`⚠️ No candles available for ${symbol} (${selectedTimeframe})`);
-          setError(`No data available for ${symbol}`);
-          allCandlesRef.current.set(selectedTimeframe, []);
+        if (response.data && mounted) {
+          console.log(`📊 Initial data loaded: ${response.data.length} candles`);
+          currentCandlesRef.current = [...response.data];
+          updateChartData(response.data);
         }
       } catch (error: any) {
-        console.error(`❌ Failed to load data for ${symbol} (${selectedTimeframe}):`, error);
+        console.error(`❌ Failed to load initial data:`, error);
         if (mounted) {
-          setError(error.response?.data?.error || 'Failed to load data');
+          setError(error.message || 'Failed to load data');
         }
       } finally {
         if (mounted) {
@@ -315,28 +235,16 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       }
     };
 
-    // Subscribe to symbol and timeframe
-    if (currentSymbolRef.current !== symbol) {
-      if (currentSymbolRef.current && subscribedRef.current) {
-        console.log(`📉 Unsubscribing from ${currentSymbolRef.current}`);
-        socket.emit('unsubscribe_symbols', [currentSymbolRef.current]);
-      }
-      
-      console.log(`📈 Subscribing to ${symbol} real-time updates`);
-      socket.emit('subscribe_symbols', [symbol]);
-      currentSymbolRef.current = symbol;
-      subscribedRef.current = true;
-    }
-
-    // Subscribe to specific timeframe candles
+    // Subscribe to WebSocket updates
     socket.emit('subscribe_timeframe', { symbol, timeframe: selectedTimeframe });
+    socket.emit('join_symbol', symbol);
 
-    // Socket event handlers
-    const handleCandleUpdate = (data: any) => {
+    // Handle progressive candle updates
+    const handleProgressiveCandleUpdate = (data: any) => {
       if (data.symbol === symbol && data.timeframe === selectedTimeframe && data.candle && mounted) {
-        const existingCandles = allCandlesRef.current.get(selectedTimeframe) || [];
+        console.log(`🔔 Progressive update: ${symbol} (${selectedTimeframe}) - ${data.isNew ? 'NEW' : 'UPDATE'} candle`);
         
-        // Find and update existing candle or add new one
+        const existingCandles = [...currentCandlesRef.current];
         const candleIndex = existingCandles.findIndex(c => c.time === data.candle.time);
         
         if (candleIndex >= 0) {
@@ -348,142 +256,101 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
           existingCandles.sort((a, b) => a.time - b.time);
         }
         
-        allCandlesRef.current.set(selectedTimeframe, existingCandles);
+        currentCandlesRef.current = existingCandles;
+        updateChartData(existingCandles);
         
-        console.log(`🔔 ${symbol} (${selectedTimeframe}): Candle update - O:${data.candle.open} H:${data.candle.high} L:${data.candle.low} C:${data.candle.close}`);
-        
-        if (chartInitializedRef.current) {
-          updateChartData();
+        // Auto-scroll to show new candles
+        if (data.isNew && chartRef.current) {
+          chartRef.current.timeScale().scrollToRealTime();
         }
       }
     };
 
-    const handleInitialCandles = (data: any) => {
-      if (data.symbol === symbol && data.timeframe === selectedTimeframe && data.candles && mounted) {
-        console.log(`📊 ${symbol} (${selectedTimeframe}): Received initial candles (${data.candles.length})`);
+    // Handle initial progressive candles
+    const handleInitialProgressiveCandles = (data: any) => {
+      if (data.symbol === symbol && data.timeframe === selectedTimeframe && mounted) {
+        console.log(`📊 Initial progressive candles: ${data.candles?.length || 0}`);
         
-        allCandlesRef.current.set(selectedTimeframe, data.candles);
-        updateChartData();
+        if (data.candles) {
+          currentCandlesRef.current = [...data.candles];
+          updateChartData(data.candles);
+        }
       }
     };
 
-    const handleSymbolTick = (data: any) => {
-      if (data.symbol === symbol && data.data && mounted) {
-        // Real-time price updates are handled by candle_update events
-        console.log(`🔔 ${symbol}: Tick - LTP=₹${data.data.last_traded_price} at ${data.data.timestamp}`);
+    // Handle progressive contest data
+    const handleProgressiveContestData = (data: any) => {
+      if (data.symbol === symbol && data.timeframes && mounted) {
+        const timeframeCandles = data.timeframes[selectedTimeframe] || [];
+        console.log(`📊 Progressive contest data: ${timeframeCandles.length} candles`);
+        
+        currentCandlesRef.current = [...timeframeCandles];
+        updateChartData(timeframeCandles);
       }
     };
 
-    if (socket) {
-      socket.on('candle_update', handleCandleUpdate);
-      socket.on('initial_candles', handleInitialCandles);
-      socket.on('symbol_tick', handleSymbolTick);
-    }
+    // Register event listeners
+    socket.on('progressive_candle_update', handleProgressiveCandleUpdate);
+    socket.on('initial_progressive_candles', handleInitialProgressiveCandles);
+    socket.on('progressive_contest_data', handleProgressiveContestData);
 
-    loadData();
+    // Load initial data
+    loadInitialData();
 
     return () => {
       mounted = false;
       if (socket) {
-        socket.off('candle_update', handleCandleUpdate);
-        socket.off('initial_candles', handleInitialCandles);
-        socket.off('symbol_tick', handleSymbolTick);
+        socket.off('progressive_candle_update', handleProgressiveCandleUpdate);
+        socket.off('initial_progressive_candles', handleInitialProgressiveCandles);
+        socket.off('progressive_contest_data', handleProgressiveContestData);
         socket.emit('unsubscribe_timeframe', { symbol, timeframe: selectedTimeframe });
       }
     };
-  }, [symbol, selectedTimeframe, socket, updateChartData]);
+  }, [symbol, selectedTimeframe, socket, isChartReady, updateChartData]);
 
-  // Auto-refresh for running contest
-  useEffect(() => {
-    if (marketState.isRunning && !marketState.isPaused && chartInitializedRef.current) {
-      console.log(`🎬 Starting auto-refresh for ${symbol} (${selectedTimeframe})`);
-      
-      const interval = setInterval(() => {
-        const candles = allCandlesRef.current.get(selectedTimeframe) || [];
-        if (candles.length > lastDataCountRef.current) {
-          updateChartData();
-        }
-      }, 1000); // Check every second
-      
-      return () => clearInterval(interval);
-    }
-  }, [marketState.isRunning, marketState.isPaused, symbol, selectedTimeframe, updateChartData]);
-
-  // Cleanup
-  useEffect(() => {
-    return () => {
-      console.log(`🧹 Cleaning up chart for ${symbol}`);
-      
-      if (chartRef.current) {
-        try {
-          chartRef.current.remove();
-        } catch (e) {
-          console.debug('Cleanup error:', e);
-        }
-      }
-      
-      if (resizeObserverRef.current) {
-        resizeObserverRef.current.disconnect();
-      }
-      
-      if (socket && subscribedRef.current && currentSymbolRef.current) {
-        socket.emit('unsubscribe_symbols', [currentSymbolRef.current]);
-        socket.emit('unsubscribe_timeframe', { 
-          symbol: currentSymbolRef.current, 
-          timeframe: selectedTimeframe 
-        });
-        subscribedRef.current = false;
-      }
-    };
-  }, [socket, selectedTimeframe]);
-
-  // Calculate display metrics
-  const currentPrice = lastTickData.get(symbol)?.price || 0;
-  const candles = allCandlesRef.current.get(selectedTimeframe) || [];
-  const firstPrice = candles.length > 0 ? candles[0].open : 0;
-  const priceChange = currentPrice - firstPrice;
-  const priceChangePercent = firstPrice ? (priceChange / firstPrice) * 100 : 0;
+  const timeSinceLastUpdate = lastUpdateTime > 0 ? Date.now() - lastUpdateTime : 0;
+  const isLiveUpdating = timeSinceLastUpdate < 10000; // Live if updated within 10 seconds
 
   return (
     <div className="bg-gray-900 rounded-lg p-4">
-      {/* Enhanced Header */}
+      {/* Header */}
       <div className="flex flex-col gap-4 mb-4">
         <div className="flex justify-between items-start">
           <div>
-            <h3 className="text-lg font-semibold text-white">
-              {symbol} - {chartType === 'line' ? 'Line Chart' : 'Candlestick Chart'}
+            <h3 className="text-xl font-bold text-white flex items-center gap-2">
+              {symbol} - Progressive {chartType === 'line' ? 'Line' : 'Candlestick'} Chart
+              {isLiveUpdating && <span className="text-green-400 animate-pulse">🔴 LIVE</span>}
             </h3>
-            {currentPrice > 0 && (
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-2xl font-bold text-white">₹{currentPrice.toFixed(2)}</span>
-                {priceChange !== 0 && (
-                  <span className={`text-sm font-medium px-2 py-1 rounded ${
-                    priceChange >= 0 ? 'bg-green-900/30 text-green-400' : 'bg-red-900/30 text-red-400'
-                  }`}>
-                    {priceChange >= 0 ? '+' : ''}₹{priceChange.toFixed(2)} ({priceChange >= 0 ? '+' : ''}{priceChangePercent.toFixed(2)}%)
-                  </span>
-                )}
+            <div className="flex items-center gap-4 mt-2 text-sm">
+              <div className="flex items-center gap-2">
+                <div className={`w-3 h-3 rounded-full ${
+                  isConnected && isLiveUpdating ? 'bg-green-500 animate-pulse' : 
+                  isConnected ? 'bg-yellow-500' : 'bg-red-500'
+                }`} />
+                <span className={`${isLiveUpdating ? 'text-green-400' : 'text-gray-400'}`}>
+                  {isConnected ? (isLiveUpdating ? 'LIVE STREAMING' : 'Connected') : 'Disconnected'}
+                </span>
               </div>
-            )}
+              
+              {marketState.isRunning && (
+                <span className="text-blue-400 font-medium">
+                  {marketState.isPaused ? '⏸️ PAUSED' : '🚀 PROGRESSIVE'} @ {marketState.speed}x
+                </span>
+              )}
+            </div>
           </div>
           
-          <div className="flex items-center gap-4 text-xs">
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${
-                isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'
-              }`} />
-              <span className="text-gray-400">{isConnected ? 'Connected' : 'Disconnected'}</span>
+          <div className="text-right">
+            <div className="text-2xl font-bold text-green-400">
+              {candleCount} Candles
             </div>
-            
-            {marketState.isRunning && (
-              <>
-                <span className="text-blue-400">
-                  {marketState.isPaused ? '⏸️ Paused' : '🕒 LIVE'} @ {marketState.speed}x
-                </span>
-                <span className="text-purple-400">
-                  Candles: {candles.length}
-                </span>
-              </>
+            <div className="text-sm text-gray-400">
+              {getTimeframeLabel(selectedTimeframe)}
+            </div>
+            {lastUpdateTime > 0 && (
+              <div className="text-xs text-gray-500 mt-1">
+                Last: {Math.floor(timeSinceLastUpdate / 1000)}s ago
+              </div>
             )}
           </div>
         </div>
@@ -499,16 +366,19 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       {/* Contest Progress */}
       {marketState.isRunning && (
         <div className="mb-4">
-          <div className="w-full bg-gray-800 rounded-full h-2">
+          <div className="w-full bg-gray-800 rounded-full h-3">
             <div 
-              className="bg-blue-600 h-2 rounded-full transition-all duration-500"
-              style={{ width: `${marketState.progress}%` }}
+              className="bg-gradient-to-r from-blue-500 via-green-500 to-yellow-500 h-3 rounded-full transition-all duration-1000 ease-out"
+              style={{ width: `${marketState.progress || 0}%` }}
             />
           </div>
-          <div className="flex justify-between mt-1 text-xs text-gray-400">
-            <span>Progress: {marketState.progress.toFixed(1)}%</span>
-            <span>Index: {marketState.currentDataIndex}/{marketState.totalDataRows}</span>
-            <span>Elapsed: {Math.floor((marketState.elapsedTime || 0) / 60000)}m</span>
+          <div className="flex justify-between mt-2 text-sm">
+            <span className="text-blue-400 font-medium">
+              Progress: {(marketState.progress || 0).toFixed(2)}%
+            </span>
+            <span className="text-green-400 font-medium">
+              Elapsed: {Math.floor((marketState.elapsedTime || 0) / 60000)}m {Math.floor(((marketState.elapsedTime || 0) % 60000) / 1000)}s
+            </span>
           </div>
         </div>
       )}
@@ -518,107 +388,80 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         <div className="mb-4 p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-200 text-sm">
           ⚠️ {error}
           <button 
-            onClick={async () => {
-              setError('');
-              setLoading(true);
-              try {
-                const data = await apiService.getCandlestick(symbol, selectedTimeframe);
-                if (data.data && data.data.length > 0) {
-                  allCandlesRef.current.set(selectedTimeframe, data.data);
-                  updateChartData();
-                  setError('');
-                } else {
-                  setError('No data available after retry');
-                }
-              } catch (err: any) {
-                setError(err.response?.data?.error || 'Failed to reload data');
-              }
-              setLoading(false);
-            }}
-            className="ml-2 text-red-300 hover:text-red-100 underline"
+            onClick={() => window.location.reload()} 
+            className="ml-3 px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-xs"
           >
-            Retry
+            Reload
           </button>
         </div>
       )}
 
       {/* Loading State */}
       {loading && (
-        <div className="flex justify-center items-center h-[500px] bg-gray-800 rounded-lg">
-          <div className="flex flex-col items-center gap-2">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
-            <div className="text-gray-400">Loading {getTimeframeLabel(selectedTimeframe)} chart...</div>
-            <div className="text-xs text-gray-500">Clean timestamps • No Python parsing needed</div>
-          </div>
+        <div className="mb-4 p-3 bg-blue-900/20 border border-blue-700 rounded-lg text-blue-200 text-sm flex items-center gap-2">
+          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-400"></div>
+          Loading progressive chart data...
         </div>
       )}
       
       {/* Chart Container */}
       <div 
         ref={chartContainerRef} 
-        className={`w-full transition-opacity duration-300 ${loading ? 'opacity-0' : 'opacity-100'}`}
+        className="w-full bg-black rounded-lg"
         style={{ 
           height: '500px',
-          minHeight: '500px',
-          display: loading ? 'none' : 'block'
+          minHeight: '500px'
         }} 
       />
       
-      {/* Success Status */}
-      {!loading && candles.length > 0 && (
-        <div className="mt-4 p-4 bg-green-900/20 border border-green-700 rounded-lg">
-          <h4 className="text-green-400 font-semibold mb-3">✅ Clean Timestamps Working Perfectly!</h4>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-            <div>
-              <span className="text-green-300">Timeframe:</span>
-              <span className="text-white ml-2 font-semibold">{getTimeframeLabel(selectedTimeframe)}</span>
-            </div>
-            <div>
-              <span className="text-green-300">Live Candles:</span>
-              <span className="text-white ml-2 font-semibold">{candles.length}</span>
-            </div>
-            <div>
-              <span className="text-green-300">Data Source:</span>
-              <span className="text-white ml-2">Clean DB Timestamps</span>
-            </div>
-            <div>
-              <span className="text-green-300">Parsing:</span>
-              <span className="text-yellow-400 ml-2 font-semibold">✅ NATIVE JS</span>
-            </div>
+      {/* Status Panel */}
+      <div className="mt-4 p-4 bg-gradient-to-r from-green-900/20 to-blue-900/20 border border-green-700/50 rounded-lg">
+        <h4 className="text-green-400 font-bold mb-3 flex items-center gap-2">
+          ✨ Progressive Chart Status
+        </h4>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+          <div>
+            <span className="text-green-300">Chart:</span>
+            <span className="text-white ml-2 font-semibold">
+              {isChartReady ? '✅ Ready' : '⏳ Loading'}
+            </span>
           </div>
-          
-          <div className="mt-3 pt-3 border-t border-green-800">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-green-300">Performance:</span>
-              <span className="font-semibold text-green-400">🚀 OPTIMIZED FOR 200+ USERS</span>
-            </div>
-            <div className="flex items-center justify-between text-xs mt-1">
-              <span className="text-green-300">Real-time Updates:</span>
-              <span className="text-white">✅ Multi-timeframe streaming</span>
-            </div>
-            <div className="flex items-center justify-between text-xs mt-1">
-              <span className="text-green-300">Memory Management:</span>
-              <span className="text-green-400">✅ Optimized caching</span>
-            </div>
+          <div>
+            <span className="text-green-300">Candles:</span>
+            <span className="text-yellow-400 ml-2 font-semibold">{candleCount}</span>
+          </div>
+          <div>
+            <span className="text-green-300">Type:</span>
+            <span className="text-blue-400 ml-2 font-semibold">{chartType}</span>
+          </div>
+          <div>
+            <span className="text-green-300">Status:</span>
+            <span className={`ml-2 font-semibold ${
+              isLiveUpdating ? 'text-green-400' : 'text-gray-400'
+            }`}>
+              {isLiveUpdating ? '🟢 LIVE' : '⚫ Idle'}
+            </span>
           </div>
         </div>
-      )}
+        
+        {marketState.isRunning && candleCount === 0 && (
+          <div className="mt-3 text-center">
+            <div className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600/20 border border-blue-500 rounded-full text-blue-300 text-sm">
+              <div className="w-2 h-2 bg-blue-400 rounded-full animate-pulse"></div>
+              Building candles progressively... Watch them appear!
+            </div>
+          </div>
+        )}
 
-      {/* No Data State */}
-      {!loading && !error && candles.length === 0 && (
-        <div className="flex justify-center items-center h-[500px] bg-gray-800 rounded-lg">
-          <div className="text-center">
-            <div className="text-6xl mb-4">📊</div>
-            <div className="text-gray-400 text-lg">Multi-Timeframe Ready</div>
-            <div className="text-gray-500 text-sm">
-              {marketState.isRunning ? 'Processing clean timestamps...' : 'Start contest for live charts'}
-            </div>
-            <div className="text-green-400 text-xs mt-2">
-              ✅ 430K+ rows • Millisecond precision • {Object.keys(allCandlesRef.current).length} timeframes loaded
+        {!marketState.isRunning && (
+          <div className="mt-3 text-center">
+            <div className="inline-flex items-center gap-2 px-4 py-2 bg-gray-600/20 border border-gray-500 rounded-full text-gray-300 text-sm">
+              <div className="w-2 h-2 bg-gray-400 rounded-full"></div>
+              Start contest to see progressive candle formation
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 };

@@ -7,23 +7,22 @@ import { useAuth } from './AuthContext';
 const WS_URL = (import.meta as any).env?.VITE_API_URL?.replace('/api', '') || 'http://localhost:3002';
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:3002/api';
 
-// Enhanced MarketState interface with your original fields + new ones
+// FIXED: Enhanced MarketState interface with corrected fields
 interface MarketState {
   isRunning: boolean;
   isPaused: boolean;
-  currentDataIndex: number;          // NEW: Added for enhanced tracking
-  totalDataRows: number;             // NEW: Added for enhanced tracking
-  progress: number;
-  elapsedTime: number;
-  speed: number;
+  currentDataIndex: number;          // Universal time seconds (0-3600)
+  totalDataRows: number;             // Total universal time (3600)
+  progress: number;                  // Percentage (0-100)
+  elapsedTime: number;               // Wall clock time elapsed
+  speed: number;                     // Speed multiplier (5x)
   contestId?: string;
   contestStartTime?: string;
-  marketStartTime?: string;
   contestEndTime?: string;
   symbols: string[];
-  timeframes: string[];              // NEW: Available timeframes
+  timeframes: string[];
   
-  // Legacy support (your original fields)
+  // Legacy support for existing components
   currentDataTick?: number;          
   totalDataTicks?: number;           
 }
@@ -33,9 +32,9 @@ interface TickData {
   price: number;
   volume?: number;
   timestamp: string;
-  absoluteTime?: string;
+  universalTime?: number;            // FIXED: Added universal time
   tickIndex: number;
-  dataIndex?: number;                // NEW: Added for enhanced tracking
+  dataIndex?: number;
   data: any;
   ohlc?: {
     open: number;
@@ -63,31 +62,30 @@ interface ContestStartData {
   message: string;
   contestId: string;
   contestStartTime: string;
-  marketStartTime?: string;
   symbols: string[];
-  totalRows: number;                 // NEW: Changed from totalTicks
+  totalRows: number;
   speed: number;
-  timeframes: string[];              // NEW: Available timeframes
+  timeframes: string[];
 }
 
 interface ContestEndData {
   message: string;
   contestId: string;
   finalResults: LeaderboardEntry[];
-  totalRows: number;                 // NEW: Changed from totalTicks
+  totalRows: number;
   endTime: string;
   contestStartTime: string;
 }
 
 interface MarketTickData {
-  tickIndex: number;
-  totalTicks: number;
+  universalTime: number;             // FIXED: Universal time instead of tick index
+  totalTime: number;                 // FIXED: Total universal time
   timestamp: string;
   prices: Record<string, number>;
   progress: number;
   contestStartTime: string;
-  marketStartTime?: string;
   elapsedTime: number;
+  tickUpdates: number;
 }
 
 interface SymbolTickData {
@@ -101,13 +99,9 @@ interface SymbolTickData {
     low_price: number;
     close_price: number;
   };
-  tickIndex: number;
-  totalTicks?: number;
-  dataIndex: number;                 // NEW: Added for enhanced tracking
+  universalTime: number;             // FIXED: Universal time
   progress: number;
   contestStartTime: string;
-  marketStartTime?: string;
-  absoluteTime?: string;
 }
 
 interface MarketContextType {
@@ -127,33 +121,33 @@ interface MarketContextType {
 const MarketContext = createContext<MarketContextType | undefined>(undefined);
 
 export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { token, user } = useAuth(); // YOUR ORIGINAL AUTH
+  const { token, user } = useAuth();
   const [socket, setSocket] = useState<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [selectedSymbol, setSelectedSymbol] = useState('ADANIENT');
   const [subscribedSymbols, setSubscribedSymbols] = useState<string[]>([]);
   const [lastTickData, setLastTickData] = useState<Map<string, TickData>>(new Map());
   
-  // ENHANCED: MarketState with new fields + your original ones
+  // FIXED: MarketState with corrected default values
   const [marketState, setMarketState] = useState<MarketState>({
     isRunning: false,
     isPaused: false,
-    currentDataIndex: 0,             // NEW: Enhanced tracking
-    totalDataRows: 0,                // NEW: Enhanced tracking
+    currentDataIndex: 0,
+    totalDataRows: 3600,               // FIXED: 1 hour in seconds
     progress: 0,
     elapsedTime: 0,
-    speed: 2,
+    speed: 5,                          // FIXED: 5x speed default
     symbols: [],
-    timeframes: ['1s', '5s', '15s', '30s', '1m', '3m', '5m', '15m'], // NEW: Default timeframes
+    timeframes: ['1s', '5s', '15s', '30s', '1m', '3m', '5m', '15m'],
     
-    // Legacy support (your original fields)
+    // Legacy support
     currentDataTick: 0,
-    totalDataTicks: 0
+    totalDataTicks: 3600
   });
 
-  // YOUR ORIGINAL CONNECTION LOGIC (PRESERVED)
+  // FIXED: WebSocket connection with enhanced error handling
   useEffect(() => {
-    console.log(`🔌 Connecting to WebSocket: ${WS_URL}`);
+    console.log(`🔌 FIXED: Connecting to WebSocket: ${WS_URL}`);
     
     const newSocket = io(WS_URL, {
       transports: ['websocket', 'polling'],
@@ -162,44 +156,44 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
       timeout: 20000,
+      forceNew: true // FIXED: Force new connection
     });
 
     newSocket.on('connect', () => {
-      console.log('✅ Connected to market WebSocket');
+      console.log('✅ FIXED: Connected to market WebSocket');
       setIsConnected(true);
       
-      // YOUR ORIGINAL AUTHENTICATION (PRESERVED)
       if (token) {
-        console.log('🔐 Authenticating WebSocket connection...');
+        console.log('🔐 FIXED: Authenticating WebSocket connection...');
         newSocket.emit('authenticate', token);
       }
     });
 
     newSocket.on('disconnect', (reason: string) => {
-      console.log('❌ Disconnected from market WebSocket:', reason);
+      console.log('❌ FIXED: Disconnected from market WebSocket:', reason);
       setIsConnected(false);
     });
 
     newSocket.on('connect_error', (error: Error) => {
-      console.error('🔌 WebSocket connection error:', error);
+      console.error('🔌 FIXED: WebSocket connection error:', error);
       setIsConnected(false);
     });
 
     newSocket.on('authenticated', (data: { success: boolean; user?: any; error?: string }) => {
       if (data.success) {
-        console.log('✅ WebSocket authenticated:', data.user?.email || 'User');
+        console.log('✅ FIXED: WebSocket authenticated:', data.user?.email || 'User');
       } else {
-        console.error('❌ WebSocket authentication failed:', data.error);
+        console.error('❌ FIXED: WebSocket authentication failed:', data.error);
       }
     });
 
-    // ENHANCED: Contest state management with new fields
+    // FIXED: Contest state management with universal time
     newSocket.on('contest_state', (state: Partial<MarketState>) => {
-      console.log('📊 Contest state update received:', {
+      console.log('📊 FIXED: Contest state update received:', {
         isRunning: state.isRunning,
         isPaused: state.isPaused,
-        currentIndex: state.currentDataIndex,
-        totalRows: state.totalDataRows,
+        universalTime: state.currentDataIndex,
+        totalTime: state.totalDataRows,
         progress: state.progress
       });
       
@@ -208,31 +202,31 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         isRunning: state.isRunning || false,
         isPaused: state.isPaused || false,
         currentDataIndex: state.currentDataIndex || 0,
-        totalDataRows: state.totalDataRows || 0,
+        totalDataRows: state.totalDataRows || 3600,
         progress: state.progress || 0,
         elapsedTime: state.elapsedTime || 0,
-        speed: state.speed || 2,
+        speed: state.speed || 5,
         contestId: state.contestId,
         contestStartTime: state.contestStartTime,
-        marketStartTime: state.marketStartTime,
         symbols: state.symbols || [],
         timeframes: state.timeframes || prev.timeframes,
         
-        // Legacy support (your original fields)
+        // Legacy support
         currentDataTick: state.currentDataIndex || 0,
-        totalDataTicks: state.totalDataRows || 0
+        totalDataTicks: state.totalDataRows || 3600
       }));
     });
 
-    // ENHANCED: Contest lifecycle events
+    // FIXED: Contest lifecycle events with enhanced logging
     newSocket.on('contest_started', (data: ContestStartData) => {
-      console.log('🚀 Contest started event:', data.message);
-      console.log('📊 Contest details:', {
+      console.log('🚀 FIXED: Contest started event:', data.message);
+      console.log('📊 FIXED: Contest details:', {
         contestId: data.contestId,
         contestStartTime: data.contestStartTime,
         symbols: data.symbols?.length || 0,
         totalRows: data.totalRows,
-        timeframes: data.timeframes?.length || 0
+        timeframes: data.timeframes?.length || 0,
+        speed: data.speed
       });
       
       setMarketState(prev => ({
@@ -241,31 +235,30 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         isPaused: false,
         contestId: data.contestId,
         contestStartTime: data.contestStartTime,
-        marketStartTime: data.marketStartTime,
         symbols: data.symbols || [],
-        totalDataRows: data.totalRows || 0,
-        speed: data.speed || 2,
+        totalDataRows: data.totalRows || 3600,
+        speed: data.speed || 5,
         currentDataIndex: 0,
         progress: 0,
         timeframes: data.timeframes || prev.timeframes,
         
-        // Legacy support (your original fields)
-        totalDataTicks: data.totalRows || 0,
+        // Legacy support
+        totalDataTicks: data.totalRows || 3600,
         currentDataTick: 0
       }));
       
       // Show success notification
       if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification('🚀 Contest Started!', {
-          body: `Trading contest has begun with ${data.symbols?.length || 0} symbols. Good luck!`,
+        new Notification('🚀 FIXED Contest Started!', {
+          body: `Trading contest has begun with ${data.symbols?.length || 0} symbols and 5x speed compression!`,
           icon: '/favicon.ico'
         });
       }
     });
 
     newSocket.on('contest_ended', (data: ContestEndData) => {
-      console.log('🏁 Contest ended event:', data.message);
-      console.log('🏆 Final results preview:', data.finalResults?.slice(0, 3));
+      console.log('🏁 FIXED: Contest ended event:', data.message);
+      console.log('🏆 FIXED: Final results preview:', data.finalResults?.slice(0, 3));
       
       setMarketState(prev => ({
         ...prev,
@@ -275,7 +268,6 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         progress: 100
       }));
       
-      // Show end notification
       if ('Notification' in window && Notification.permission === 'granted') {
         const winner = data.finalResults?.[0];
         new Notification('🏁 Contest Ended!', {
@@ -288,65 +280,49 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     });
 
     newSocket.on('contest_paused', (data: { message: string }) => {
-      console.log('⏸️ Contest paused event:', data.message);
+      console.log('⏸️ FIXED: Contest paused event:', data.message);
       setMarketState(prev => ({ ...prev, isPaused: true }));
-      
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification('⏸️ Contest Paused', {
-          body: 'Trading has been temporarily paused',
-          icon: '/favicon.ico'
-        });
-      }
     });
 
     newSocket.on('contest_resumed', (data: { message: string }) => {
-      console.log('▶️ Contest resumed event:', data.message);
+      console.log('▶️ FIXED: Contest resumed event:', data.message);
       setMarketState(prev => ({ ...prev, isPaused: false }));
-      
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification('▶️ Contest Resumed', {
-          body: 'Trading has resumed. Good luck!',
-          icon: '/favicon.ico'
-        });
-      }
     });
 
     newSocket.on('speed_changed', (data: { newSpeed: number; message: string }) => {
-      console.log('⚡ Speed changed event:', data.message);
+      console.log('⚡ FIXED: Speed changed event:', data.message);
       setMarketState(prev => ({ ...prev, speed: data.newSpeed }));
     });
 
-    // ENHANCED: Market-wide tick updates with new field names
+    // FIXED: Market-wide tick updates with universal time
     newSocket.on('market_tick', (data: MarketTickData) => {
-      // Update market state efficiently
+      // FIXED: Update market state with universal time
       setMarketState(prev => ({
         ...prev,
-        currentDataIndex: data.tickIndex,
-        totalDataRows: data.totalTicks,
+        currentDataIndex: data.universalTime,
+        totalDataRows: data.totalTime,
         progress: data.progress || 0,
         elapsedTime: data.elapsedTime || 0,
         contestStartTime: data.contestStartTime,
-        marketStartTime: data.marketStartTime,
         
-        // Legacy support (your original fields)
-        currentDataTick: data.tickIndex,
-        totalDataTicks: data.totalTicks
+        // Legacy support
+        currentDataTick: Math.floor(data.universalTime),
+        totalDataTicks: data.totalTime
       }));
 
-      // Batch update last tick data for performance
+      // FIXED: Batch update last tick data efficiently
       if (data.prices && Object.keys(data.prices).length > 0) {
         setLastTickData(prev => {
           const newMap = new Map(prev);
           
-          // Efficiently update multiple symbols at once
           Object.entries(data.prices).forEach(([symbol, price]: [string, number]) => {
             const existingData = newMap.get(symbol);
             newMap.set(symbol, {
               symbol,
               price: price,
               timestamp: data.timestamp,
-              tickIndex: data.tickIndex,
-              dataIndex: data.tickIndex, // NEW: Enhanced tracking
+              universalTime: data.universalTime,
+              tickIndex: Math.floor(data.universalTime),
               volume: existingData?.volume || 0,
               data: existingData?.data || {},
               ohlc: existingData?.ohlc
@@ -357,27 +333,25 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         });
       }
       
-      // Debug output for monitoring (only every 100 ticks to avoid spam)
-      if (data.tickIndex % 100 === 0) {
-        console.log(`📊 Market tick ${data.tickIndex}/${data.totalTicks} (${data.progress?.toFixed(1)}%) - ${Object.keys(data.prices || {}).length} symbols updated`);
+      // FIXED: Debug output with universal time
+      if (Math.floor(data.universalTime) % 100 === 0) {
+        console.log(`📊 FIXED: Market tick ${data.universalTime.toFixed(1)}/${data.totalTime} (${data.progress?.toFixed(1)}%) - ${Object.keys(data.prices || {}).length} symbols updated`);
       }
     });
 
-    // ENHANCED: Individual symbol tick updates with new fields
+    // FIXED: Individual symbol tick updates with universal time
     newSocket.on('symbol_tick', (data: SymbolTickData) => {
       if (data.symbol && data.data) {
         setLastTickData(prev => {
           const newMap = new Map(prev);
           
-          // Create comprehensive tick data object
           const tickData: TickData = {
             symbol: data.symbol,
             price: data.data.last_traded_price,
             volume: data.data.volume_traded,
             timestamp: data.data.timestamp,
-            absoluteTime: data.absoluteTime,
-            tickIndex: data.tickIndex,
-            dataIndex: data.dataIndex, // NEW: Enhanced tracking
+            universalTime: data.universalTime,
+            tickIndex: Math.floor(data.universalTime),
             data: data.data,
             ohlc: {
               open: data.data.open_price,
@@ -391,14 +365,14 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           return newMap;
         });
 
-        // Debug output for individual symbols (throttled)
-        if (data.dataIndex % 50 === 0) {
-          console.log(`📈 ${data.symbol}: ₹${data.data.last_traded_price.toFixed(2)} | Index: ${data.dataIndex}`);
+        // FIXED: Debug output with universal time
+        if (Math.floor(data.universalTime) % 50 === 0) {
+          console.log(`📈 FIXED: ${data.symbol}: ₹${data.data.last_traded_price.toFixed(2)} | Universal Time: ${data.universalTime.toFixed(1)}`);
         }
       }
     });
 
-    // Portfolio and leaderboard updates (your original logic)
+    // Portfolio and leaderboard updates (preserved)
     newSocket.on('portfolio_update', (portfolio: {
       total_wealth?: number;
       total_pnl?: number;
@@ -422,23 +396,24 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     // Error handling
     newSocket.on('error', (error: Error) => {
-      console.error('🔴 WebSocket error:', error);
+      console.error('🔴 FIXED: WebSocket error:', error);
     });
 
     setSocket(newSocket);
 
-    // ENHANCED: Fetch initial contest state with retry logic
+    // FIXED: Fetch initial contest state with retry logic
     const fetchInitialState = async (retries: number = 3): Promise<void> => {
       try {
-        console.log('📊 Fetching initial contest state...');
+        console.log('📊 FIXED: Fetching initial contest state...');
         const { data } = await axios.get(`${API_URL}/contest/state`);
         
-        console.log('✅ Initial contest state loaded:', {
+        console.log('✅ FIXED: Initial contest state loaded:', {
           isRunning: data.isRunning,
           isPaused: data.isPaused,
-          currentIndex: data.currentDataIndex,
-          totalRows: data.totalDataRows,
-          symbols: data.symbols?.length || 0
+          universalTime: data.currentDataIndex,
+          totalTime: data.totalDataRows,
+          symbols: data.symbols?.length || 0,
+          speed: data.speed
         });
         
         setMarketState(prev => ({
@@ -446,25 +421,24 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           isRunning: data.isRunning || false,
           isPaused: data.isPaused || false,
           currentDataIndex: data.currentDataIndex || 0,
-          totalDataRows: data.totalDataRows || 0,
+          totalDataRows: data.totalDataRows || 3600,
           progress: data.progress || 0,
           elapsedTime: data.elapsedTime || 0,
-          speed: data.speed || 2,
+          speed: data.speed || 5,
           contestId: data.contestId,
           contestStartTime: data.contestStartTime,
-          marketStartTime: data.marketStartTime,
           contestEndTime: data.contestEndTime,
           symbols: data.symbols || [],
           timeframes: data.timeframes || prev.timeframes,
           
-          // Legacy support (your original fields)
+          // Legacy support
           currentDataTick: data.currentDataIndex || 0,
-          totalDataTicks: data.totalDataRows || 0
+          totalDataTicks: data.totalDataRows || 3600
         }));
       } catch (error) {
-        console.error('❌ Failed to fetch initial contest state:', error);
+        console.error('❌ FIXED: Failed to fetch initial contest state:', error);
         if (retries > 0) {
-          console.log(`🔄 Retrying in 2 seconds... (${retries} attempts left)`);
+          console.log(`🔄 FIXED: Retrying in 2 seconds... (${retries} attempts left)`);
           setTimeout(() => fetchInitialState(retries - 1), 2000);
         }
       }
@@ -475,55 +449,55 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     // Request notification permission
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission().then((permission: NotificationPermission) => {
-        console.log('🔔 Notification permission:', permission);
+        console.log('🔔 FIXED: Notification permission:', permission);
       });
     }
 
     return () => {
-      console.log('🧹 Cleaning up WebSocket connection');
+      console.log('🧹 FIXED: Cleaning up WebSocket connection');
       newSocket.close();
     };
-  }, [token]); // YOUR ORIGINAL DEPENDENCY
+  }, [token]);
 
-  // YOUR ORIGINAL SUBSCRIPTION FUNCTIONS (PRESERVED)
+  // FIXED: Subscription functions with enhanced error handling
   const subscribeToMultipleSymbols = (symbols: string[]): void => {
     if (!socket || !socket.connected || symbols.length === 0) {
-      console.warn('⚠️ Cannot subscribe: socket not ready or no symbols provided');
+      console.warn('⚠️ FIXED: Cannot subscribe: socket not ready or no symbols provided');
       return;
     }
     
     const newSymbols = symbols.filter((symbol: string) => !subscribedSymbols.includes(symbol));
     if (newSymbols.length === 0) {
-      console.log('ℹ️ All requested symbols already subscribed');
+      console.log('ℹ️ FIXED: All requested symbols already subscribed');
       return;
     }
     
-    console.log(`📈 Subscribing to ${newSymbols.length} new symbols:`, newSymbols.join(', '));
+    console.log(`📈 FIXED: Subscribing to ${newSymbols.length} new symbols:`, newSymbols.join(', '));
     socket.emit('subscribe_symbols', newSymbols);
     setSubscribedSymbols(prev => {
       const updated = [...prev, ...newSymbols];
-      console.log(`✅ Total subscribed symbols: ${updated.length}`);
+      console.log(`✅ FIXED: Total subscribed symbols: ${updated.length}`);
       return updated;
     });
   };
 
   const unsubscribeFromMultipleSymbols = (symbols: string[]): void => {
     if (!socket || !socket.connected || symbols.length === 0) {
-      console.warn('⚠️ Cannot unsubscribe: socket not ready or no symbols provided');
+      console.warn('⚠️ FIXED: Cannot unsubscribe: socket not ready or no symbols provided');
       return;
     }
     
     const symbolsToUnsubscribe = symbols.filter((symbol: string) => subscribedSymbols.includes(symbol));
     if (symbolsToUnsubscribe.length === 0) {
-      console.log('ℹ️ No subscribed symbols to unsubscribe from');
+      console.log('ℹ️ FIXED: No subscribed symbols to unsubscribe from');
       return;
     }
     
-    console.log(`📉 Unsubscribing from ${symbolsToUnsubscribe.length} symbols:`, symbolsToUnsubscribe.join(', '));
+    console.log(`📉 FIXED: Unsubscribing from ${symbolsToUnsubscribe.length} symbols:`, symbolsToUnsubscribe.join(', '));
     socket.emit('unsubscribe_symbols', symbolsToUnsubscribe);
     setSubscribedSymbols(prev => {
       const updated = prev.filter((s: string) => !symbolsToUnsubscribe.includes(s));
-      console.log(`✅ Remaining subscribed symbols: ${updated.length}`);
+      console.log(`✅ FIXED: Remaining subscribed symbols: ${updated.length}`);
       return updated;
     });
     
@@ -543,17 +517,17 @@ export const MarketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     unsubscribeFromMultipleSymbols([symbol]);
   };
 
-  // YOUR ORIGINAL CONNECTION STATUS MONITORING (PRESERVED)
+  // FIXED: Connection status monitoring
   useEffect(() => {
     const handleOnline = (): void => {
-      console.log('🌐 Network connection restored');
+      console.log('🌐 FIXED: Network connection restored');
       if (socket && !socket.connected) {
         socket.connect();
       }
     };
 
     const handleOffline = (): void => {
-      console.log('🔌 Network connection lost');
+      console.log('🔌 FIXED: Network connection lost');
       setIsConnected(false);
     };
 
@@ -595,5 +569,4 @@ export const useMarket = (): MarketContextType => {
   return context;
 };
 
-// Export types for use in other components
 export type { MarketState, TickData, MarketContextType, LeaderboardEntry };
