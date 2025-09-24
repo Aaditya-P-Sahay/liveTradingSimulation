@@ -24,47 +24,35 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
   const { socket, isConnected, marketState } = useMarket();
   const { selectedTimeframe, setSelectedTimeframe, getTimeframeLabel } = useTimeframes();
   
-  // Store current candles
   const currentCandlesRef = useRef<any[]>([]);
 
-  // Initialize chart with proper configuration
+  // Initialize chart
   const initializeChart = useCallback(() => {
     if (!chartContainerRef.current || chartRef.current) return;
 
-    console.log(`🎯 Initializing ${chartType} chart for ${symbol} (${selectedTimeframe})`);
-    
     try {
       const container = chartContainerRef.current;
-      const rect = container.getBoundingClientRect();
       
       const chart = createChart(container, {
-        width: Math.max(rect.width || 800, 400),
+        width: 800,
         height: 500,
         layout: {
           background: { color: '#000000' },
           textColor: '#ffffff',
         },
         grid: {
-          vertLines: { color: '#1e1e1e' },
-          horzLines: { color: '#1e1e1e' },
-        },
-        crosshair: {
-          mode: 1,
-          vertLine: { color: '#758696', width: 1, style: 1 },
-          horzLine: { color: '#758696', width: 1, style: 1 },
+          vertLines: { color: '#1a1a1a' },
+          horzLines: { color: '#1a1a1a' },
         },
         timeScale: {
           timeVisible: true,
           secondsVisible: true,
-          borderColor: '#2e2e2e',
+          borderColor: '#333333',
           rightOffset: 12,
           barSpacing: 6,
-          fixLeftEdge: false,
-          lockVisibleTimeRangeOnResize: false,
-          rightBarStaysOnScroll: true,
         },
         rightPriceScale: {
-          borderColor: '#2e2e2e',
+          borderColor: '#333333',
           scaleMargins: { top: 0.1, bottom: 0.1 },
         },
       });
@@ -77,7 +65,6 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
           lineWidth: 2,
           priceLineVisible: true,
           lastValueVisible: true,
-          crosshairMarkerVisible: true,
         });
         seriesRef.current = lineSeries;
       } else {
@@ -94,15 +81,14 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         seriesRef.current = candlestickSeries;
       }
 
-      // Handle resize
+      // Resize handling
       const resizeObserver = new ResizeObserver((entries) => {
         if (chartRef.current) {
           const entry = entries[0];
           if (entry) {
-            const { width: newWidth, height: newHeight } = entry.contentRect;
-            chartRef.current.applyOptions({ 
-              width: Math.max(newWidth, 400), 
-              height: Math.max(newHeight, 400) 
+            chart.applyOptions({ 
+              width: Math.max(entry.contentRect.width, 400), 
+              height: 500 
             });
           }
         }
@@ -120,11 +106,9 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
     }
   }, [chartType, symbol, selectedTimeframe]);
 
-  // Update chart data
+  // Update chart with new data
   const updateChartData = useCallback((candles: any[]) => {
-    if (!seriesRef.current || !isChartReady || !candles || candles.length === 0) {
-      return;
-    }
+    if (!seriesRef.current || !isChartReady || !candles) return;
 
     try {
       if (chartType === 'candlestick') {
@@ -151,34 +135,29 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       setLastUpdateTime(Date.now());
       setError('');
       
-      console.log(`📊 Chart updated: ${candles.length} candles for ${symbol} (${selectedTimeframe})`);
-      
     } catch (error) {
       console.error('❌ Chart update error:', error);
       setError('Failed to update chart');
     }
-  }, [chartType, selectedTimeframe, symbol, isChartReady]);
+  }, [chartType, isChartReady]);
 
   // Handle timeframe changes
   const handleTimeframeChange = useCallback((newTimeframe: string) => {
-    console.log(`🔄 Changing timeframe to ${newTimeframe} for ${symbol}`);
+    console.log(`🔄 Changing timeframe to ${newTimeframe}`);
     
-    // Clear current data
     currentCandlesRef.current = [];
     setCandleCount(0);
     setLastUpdateTime(0);
     
-    // Clear chart
     if (seriesRef.current) {
       seriesRef.current.setData([]);
     }
     
     setSelectedTimeframe(newTimeframe);
-  }, [setSelectedTimeframe, symbol]);
+  }, [setSelectedTimeframe]);
 
   // Initialize chart when dependencies change
   useEffect(() => {
-    // Clean up existing chart
     if (chartRef.current) {
       try {
         chartRef.current.remove();
@@ -190,13 +169,11 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       setIsChartReady(false);
     }
     
-    // Clear data
     currentCandlesRef.current = [];
     setCandleCount(0);
     setLastUpdateTime(0);
     setError('');
     
-    // Initialize new chart
     const initTimeout = setTimeout(() => {
       initializeChart();
     }, 100);
@@ -204,27 +181,23 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
     return () => clearTimeout(initTimeout);
   }, [chartType, selectedTimeframe, initializeChart]);
 
-  // Setup WebSocket and load initial data
+  // Setup WebSocket for real-time updates
   useEffect(() => {
     if (!symbol || !socket || !isChartReady) return;
 
     let mounted = true;
-    console.log(`🔄 Setting up progressive data for ${symbol} (${selectedTimeframe})`);
 
     // Load initial data
     const loadInitialData = async () => {
       try {
         setLoading(true);
-        
         const response = await apiService.getCandlestick(symbol, selectedTimeframe);
         
         if (response.data && mounted) {
-          console.log(`📊 Initial data loaded: ${response.data.length} candles`);
           currentCandlesRef.current = [...response.data];
           updateChartData(response.data);
         }
       } catch (error: any) {
-        console.error(`❌ Failed to load initial data:`, error);
         if (mounted) {
           setError(error.message || 'Failed to load data');
         }
@@ -235,41 +208,30 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       }
     };
 
-    // Subscribe to WebSocket updates
+    // Subscribe to real-time updates
     socket.emit('subscribe_timeframe', { symbol, timeframe: selectedTimeframe });
     socket.emit('join_symbol', symbol);
 
-    // Handle progressive candle updates
-    const handleProgressiveCandleUpdate = (data: any) => {
+    // Handle new candles (real-time)
+    const handleNewCandle = (data: any) => {
       if (data.symbol === symbol && data.timeframe === selectedTimeframe && data.candle && mounted) {
-        console.log(`🔔 Progressive update: ${symbol} (${selectedTimeframe}) - ${data.isNew ? 'NEW' : 'UPDATE'} candle`);
+        console.log(`🔔 NEW CANDLE: ${symbol} ${selectedTimeframe} - Total: ${data.totalCandles}`);
         
-        const existingCandles = [...currentCandlesRef.current];
-        const candleIndex = existingCandles.findIndex(c => c.time === data.candle.time);
-        
-        if (candleIndex >= 0) {
-          // Update existing candle
-          existingCandles[candleIndex] = data.candle;
-        } else {
-          // Add new candle
-          existingCandles.push(data.candle);
-          existingCandles.sort((a, b) => a.time - b.time);
-        }
-        
-        currentCandlesRef.current = existingCandles;
-        updateChartData(existingCandles);
+        const updatedCandles = [...currentCandlesRef.current, data.candle];
+        currentCandlesRef.current = updatedCandles;
+        updateChartData(updatedCandles);
         
         // Auto-scroll to show new candles
-        if (data.isNew && chartRef.current) {
+        if (chartRef.current) {
           chartRef.current.timeScale().scrollToRealTime();
         }
       }
     };
 
-    // Handle initial progressive candles
-    const handleInitialProgressiveCandles = (data: any) => {
+    // Handle initial candles
+    const handleInitialCandles = (data: any) => {
       if (data.symbol === symbol && data.timeframe === selectedTimeframe && mounted) {
-        console.log(`📊 Initial progressive candles: ${data.candles?.length || 0}`);
+        console.log(`📊 Initial candles: ${data.candles?.length || 0}`);
         
         if (data.candles) {
           currentCandlesRef.current = [...data.candles];
@@ -278,11 +240,11 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       }
     };
 
-    // Handle progressive contest data
-    const handleProgressiveContestData = (data: any) => {
+    // Handle symbol data
+    const handleSymbolData = (data: any) => {
       if (data.symbol === symbol && data.timeframes && mounted) {
         const timeframeCandles = data.timeframes[selectedTimeframe] || [];
-        console.log(`📊 Progressive contest data: ${timeframeCandles.length} candles`);
+        console.log(`📊 Symbol data: ${timeframeCandles.length} candles`);
         
         currentCandlesRef.current = [...timeframeCandles];
         updateChartData(timeframeCandles);
@@ -290,9 +252,9 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
     };
 
     // Register event listeners
-    socket.on('progressive_candle_update', handleProgressiveCandleUpdate);
-    socket.on('initial_progressive_candles', handleInitialProgressiveCandles);
-    socket.on('progressive_contest_data', handleProgressiveContestData);
+    socket.on('new_candle', handleNewCandle);
+    socket.on('initial_candles', handleInitialCandles);
+    socket.on('symbol_data', handleSymbolData);
 
     // Load initial data
     loadInitialData();
@@ -300,16 +262,16 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
     return () => {
       mounted = false;
       if (socket) {
-        socket.off('progressive_candle_update', handleProgressiveCandleUpdate);
-        socket.off('initial_progressive_candles', handleInitialProgressiveCandles);
-        socket.off('progressive_contest_data', handleProgressiveContestData);
+        socket.off('new_candle', handleNewCandle);
+        socket.off('initial_candles', handleInitialCandles);
+        socket.off('symbol_data', handleSymbolData);
         socket.emit('unsubscribe_timeframe', { symbol, timeframe: selectedTimeframe });
       }
     };
   }, [symbol, selectedTimeframe, socket, isChartReady, updateChartData]);
 
   const timeSinceLastUpdate = lastUpdateTime > 0 ? Date.now() - lastUpdateTime : 0;
-  const isLiveUpdating = timeSinceLastUpdate < 10000; // Live if updated within 10 seconds
+  const isLiveUpdating = timeSinceLastUpdate < 15000; // Live if updated within 15 seconds
 
   return (
     <div className="bg-gray-900 rounded-lg p-4">
@@ -318,7 +280,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         <div className="flex justify-between items-start">
           <div>
             <h3 className="text-xl font-bold text-white flex items-center gap-2">
-              {symbol} - Progressive {chartType === 'line' ? 'Line' : 'Candlestick'} Chart
+              {symbol} - Real-Time {chartType === 'line' ? 'Line' : 'Candlestick'} Chart
               {isLiveUpdating && <span className="text-green-400 animate-pulse">🔴 LIVE</span>}
             </h3>
             <div className="flex items-center gap-4 mt-2 text-sm">
@@ -328,13 +290,13 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
                   isConnected ? 'bg-yellow-500' : 'bg-red-500'
                 }`} />
                 <span className={`${isLiveUpdating ? 'text-green-400' : 'text-gray-400'}`}>
-                  {isConnected ? (isLiveUpdating ? 'LIVE STREAMING' : 'Connected') : 'Disconnected'}
+                  {isConnected ? (isLiveUpdating ? 'LIVE' : 'Connected') : 'Disconnected'}
                 </span>
               </div>
               
               {marketState.isRunning && (
                 <span className="text-blue-400 font-medium">
-                  {marketState.isPaused ? '⏸️ PAUSED' : '🚀 PROGRESSIVE'} @ {marketState.speed}x
+                  {marketState.isPaused ? '⏸️ PAUSED' : '🚀 RUNNING'}
                 </span>
               )}
             </div>
@@ -363,18 +325,18 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         />
       </div>
 
-      {/* Contest Progress */}
+      {/* Contest Progress - FIXED: Based on real time */}
       {marketState.isRunning && (
         <div className="mb-4">
           <div className="w-full bg-gray-800 rounded-full h-3">
             <div 
-              className="bg-gradient-to-r from-blue-500 via-green-500 to-yellow-500 h-3 rounded-full transition-all duration-1000 ease-out"
-              style={{ width: `${marketState.progress || 0}%` }}
+              className="bg-gradient-to-r from-blue-500 to-green-500 h-3 rounded-full transition-all duration-1000"
+              style={{ width: `${Math.min(marketState.progress || 0, 100)}%` }}
             />
           </div>
           <div className="flex justify-between mt-2 text-sm">
             <span className="text-blue-400 font-medium">
-              Progress: {(marketState.progress || 0).toFixed(2)}%
+              Progress: {(marketState.progress || 0).toFixed(1)}%
             </span>
             <span className="text-green-400 font-medium">
               Elapsed: {Math.floor((marketState.elapsedTime || 0) / 60000)}m {Math.floor(((marketState.elapsedTime || 0) % 60000) / 1000)}s
@@ -387,12 +349,6 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       {error && (
         <div className="mb-4 p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-200 text-sm">
           ⚠️ {error}
-          <button 
-            onClick={() => window.location.reload()} 
-            className="ml-3 px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-xs"
-          >
-            Reload
-          </button>
         </div>
       )}
 
@@ -400,7 +356,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       {loading && (
         <div className="mb-4 p-3 bg-blue-900/20 border border-blue-700 rounded-lg text-blue-200 text-sm flex items-center gap-2">
           <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-400"></div>
-          Loading progressive chart data...
+          Loading chart data...
         </div>
       )}
       
@@ -416,14 +372,14 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
       
       {/* Status Panel */}
       <div className="mt-4 p-4 bg-gradient-to-r from-green-900/20 to-blue-900/20 border border-green-700/50 rounded-lg">
-        <h4 className="text-green-400 font-bold mb-3 flex items-center gap-2">
-          ✨ Progressive Chart Status
+        <h4 className="text-green-400 font-bold mb-3">
+          ✨ Real-Time Chart Status
         </h4>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
           <div>
-            <span className="text-green-300">Chart:</span>
+            <span className="text-green-300">Mode:</span>
             <span className="text-white ml-2 font-semibold">
-              {isChartReady ? '✅ Ready' : '⏳ Loading'}
+              {isLiveUpdating ? '🟢 LIVE' : '⚫ Waiting'}
             </span>
           </div>
           <div>
@@ -431,24 +387,20 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
             <span className="text-yellow-400 ml-2 font-semibold">{candleCount}</span>
           </div>
           <div>
-            <span className="text-green-300">Type:</span>
-            <span className="text-blue-400 ml-2 font-semibold">{chartType}</span>
+            <span className="text-green-300">Timeframe:</span>
+            <span className="text-blue-400 ml-2 font-semibold">{getTimeframeLabel(selectedTimeframe)}</span>
           </div>
           <div>
-            <span className="text-green-300">Status:</span>
-            <span className={`ml-2 font-semibold ${
-              isLiveUpdating ? 'text-green-400' : 'text-gray-400'
-            }`}>
-              {isLiveUpdating ? '🟢 LIVE' : '⚫ Idle'}
-            </span>
+            <span className="text-green-300">Type:</span>
+            <span className="text-purple-400 ml-2 font-semibold">{chartType}</span>
           </div>
         </div>
         
-        {marketState.isRunning && candleCount === 0 && (
+        {marketState.isRunning && (
           <div className="mt-3 text-center">
-            <div className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600/20 border border-blue-500 rounded-full text-blue-300 text-sm">
-              <div className="w-2 h-2 bg-blue-400 rounded-full animate-pulse"></div>
-              Building candles progressively... Watch them appear!
+            <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-600/20 border border-green-500 rounded-full text-green-300 text-sm">
+              <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+              New candle every {getTimeframeLabel(selectedTimeframe).toLowerCase()} in real-time!
             </div>
           </div>
         )}
@@ -456,8 +408,7 @@ export const LiveStockChart: React.FC<LiveStockChartProps> = ({ symbol, chartTyp
         {!marketState.isRunning && (
           <div className="mt-3 text-center">
             <div className="inline-flex items-center gap-2 px-4 py-2 bg-gray-600/20 border border-gray-500 rounded-full text-gray-300 text-sm">
-              <div className="w-2 h-2 bg-gray-400 rounded-full"></div>
-              Start contest to see progressive candle formation
+              Start contest to see real-time candle formation
             </div>
           </div>
         )}
