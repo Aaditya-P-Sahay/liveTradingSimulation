@@ -125,6 +125,19 @@ class ApiService {
   async health() {
     return this.request('/api/health');
   }
+  // Add these methods to the existing ApiService class
+
+  async pauseContest() {
+  return this.request('/api/admin/contest/pause', {
+    method: 'POST',
+  });
+  }
+
+  async resumeContest() {
+  return this.request('/api/admin/contest/resume', {
+    method: 'POST',
+  });
+  }
 }
 
 export const apiService = new ApiService();

@@ -124,7 +124,7 @@ export const Dashboard: React.FC = () => {
     
     // Simple mock calculation - in real app you'd track opening prices
     const mockChange = (currentPrice * 0.001) * (Math.random() - 0.5) * 4;
-    const mockChangePercent = (mockChange / currentPrice) * 100;
+    const mockChangePercent = currentPrice ? (mockChange / currentPrice) * 100 : 0;
     
     return {
       price: currentPrice,
@@ -259,7 +259,7 @@ export const Dashboard: React.FC = () => {
           <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
             {/* Main Content - Charts and Trading */}
             <div className="xl:col-span-3">
-              {/* ENHANCED Stock Selector */}
+              {/* Stock Selector - FIXED */}
               <div className="mb-6 bg-gray-900 rounded-lg p-6 shadow-lg">
                 <div className="flex flex-col lg:flex-row gap-6 items-start lg:items-center">
                   <div className="flex-1 min-w-0">
@@ -269,12 +269,15 @@ export const Dashboard: React.FC = () => {
                     <select
                       value={selectedSymbol || ''}
                       onChange={(e) => {
-                        console.log(`📈 Changing symbol to: ${e.target.value}`);
-                        setSelectedSymbol(e.target.value);
-                        setChartKey(prev => prev + 1); // Force chart remount
+                        const newSymbol = e.target.value;
+                        console.log(`📈 Changing symbol from ${selectedSymbol} to ${newSymbol}`);
+                        setSelectedSymbol(newSymbol);
+                        // Force chart reload by changing key
+                        setChartKey(prev => prev + 1);
                       }}
                       className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent text-lg font-medium"
                     >
+                      <option value="" disabled>Select a symbol</option>
                       {symbols.map((sym) => (
                         <option key={sym} value={sym}>
                           {sym}
@@ -328,10 +331,10 @@ export const Dashboard: React.FC = () => {
                 </div>
               </div>
 
-              {/* ENHANCED Chart Section */}
+              {/* Chart Section - FIXED */}
               {selectedSymbol && (
                 <div className="mb-6">
-                  {/* FIXED Chart Type Buttons */}
+                  {/* Chart Type Buttons */}
                   <div className="flex gap-3 mb-6">
                     <button
                       onClick={() => handleChartTypeChange('line')}
@@ -355,27 +358,13 @@ export const Dashboard: React.FC = () => {
                       <BarChart3 className="w-5 h-5" />
                       Candlesticks
                     </button>
-                    
-                    {/* Chart Info */}
-                    <div className="ml-auto flex items-center gap-4 text-sm text-gray-400">
-                      <div className="flex items-center gap-2">
-                        <Eye className="w-4 h-4" />
-                        <span>30s intervals</span>
-                      </div>
-                      {marketState.isRunning && (
-                        <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                          <span>Live updates</span>
-                        </div>
-                      )}
-                    </div>
                   </div>
                   
-                  {/* FIXED Chart Component */}
+                  {/* CRITICAL Fix: Unique key forces chart remount on symbol change */}
                   <LiveStockChart 
                     symbol={selectedSymbol} 
                     chartType={chartType}
-                    key={`chart-${selectedSymbol}-${chartType}-${chartKey}`} // Force remount with unique key
+                    key={`chart-${selectedSymbol}-${chartType}-${chartKey}`}
                   />
                 </div>
               )}

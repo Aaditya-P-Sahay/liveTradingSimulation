@@ -2,24 +2,47 @@ import React, { useState, useEffect } from 'react';
 import { apiService } from '../../services/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { useMarket } from '../../contexts/MarketContext';
-import { Play, Pause, Square, Settings, Zap, Users, BarChart3 } from 'lucide-react';
+import { 
+  Play, 
+  Pause, 
+  Square, 
+  Settings, 
+  Zap, 
+  Users, 
+  BarChart3, 
+  Clock,
+  Database,
+  Activity,
+  AlertTriangle,
+  RefreshCw,
+  TrendingUp,
+  Server
+} from 'lucide-react';
 
 export const AdminControls: React.FC = () => {
   const { token, user } = useAuth();
   const { marketState } = useMarket();
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
+  const [messageType, setMessageType] = useState<'success' | 'error' | 'warning'>('success');
   const [adminStatus, setAdminStatus] = useState<any>(null);
-  const [speedInput, setSpeedInput] = useState(2);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showDataInfo, setShowDataInfo] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
 
   // Only show for admins
   if (user?.role !== 'admin') return null;
 
   useEffect(() => {
     loadAdminStatus();
-    setSpeedInput(marketState.speed);
-  }, [marketState.speed]);
+    
+    // Auto-refresh status every 5 seconds if enabled
+    const interval = autoRefresh ? setInterval(loadAdminStatus, 5000) : null;
+    
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [autoRefresh]);
 
   const loadAdminStatus = async () => {
     try {
@@ -30,252 +53,378 @@ export const AdminControls: React.FC = () => {
     }
   };
 
+  const showMessage = (msg: string, type: 'success' | 'error' | 'warning' = 'success', duration = 5000) => {
+    setMessage(msg);
+    setMessageType(type);
+    setTimeout(() => setMessage(''), duration);
+  };
+
   const handleAction = async (action: string, actionFn: () => Promise<any>, successMsg: string) => {
     setLoading(true);
     setMessage('');
     
     try {
       const result = await actionFn();
-      setMessage(`✅ ${successMsg}`);
+      showMessage(`✅ ${successMsg}`, 'success');
       await loadAdminStatus();
-      
-      // Clear message after 3 seconds
-      setTimeout(() => setMessage(''), 3000);
     } catch (error: any) {
-      setMessage(`❌ ${error.response?.data?.error || `Failed to ${action}`}`);
-      setTimeout(() => setMessage(''), 5000);
+      showMessage(`❌ ${error.response?.data?.error || `Failed to ${action}`}`, 'error');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleStart = () => handleAction(
-    'start', 
-    () => apiService.startContest(), 
-    'Contest started successfully!'
-  );
+  const handleStart = () => {
+    if (marketState.isRunning && !marketState.isPaused) {
+      showMessage('⚠️ Contest is already running', 'warning');
+      return;
+    }
+    
+    handleAction(
+      'start', 
+      () => apiService.startContest(), 
+      'Contest started successfully! Data streaming begins now.'
+    );
+  };
 
-  const handlePause = () => handleAction(
-    'pause', 
-    () => apiService.pauseContest(), 
-    'Contest paused'
-  );
+  const handlePause = () => {
+    if (!marketState.isRunning) {
+      showMessage('⚠️ Contest is not running', 'warning');
+      return;
+    }
+    
+    if (marketState.isPaused) {
+      showMessage('⚠️ Contest is already paused', 'warning');
+      return;
+    }
+    
+    handleAction(
+      'pause', 
+      () => apiService.pauseContest(), 
+      'Contest paused. All trading suspended.'
+    );
+  };
 
-  const handleResume = () => handleAction(
-    'resume', 
-    () => apiService.resumeContest(), 
-    'Contest resumed'
-  );
+  const handleResume = () => {
+    if (!marketState.isRunning) {
+      showMessage('⚠️ Contest is not running', 'warning');
+      return;
+    }
+    
+    if (!marketState.isPaused) {
+      showMessage('⚠️ Contest is not paused', 'warning');
+      return;
+    }
+    
+    handleAction(
+      'resume', 
+      () => apiService.resumeContest(), 
+      'Contest resumed. Trading enabled.'
+    );
+  };
 
   const handleStop = () => {
-    if (confirm('Are you sure you want to stop the contest? All positions will be auto squared-off.')) {
+    if (!marketState.isRunning) {
+      showMessage('⚠️ Contest is not running', 'warning');
+      return;
+    }
+    
+    if (confirm('⚠️ WARNING: This will:\n\n• Stop the contest immediately\n• Auto square-off ALL short positions\n• Finalize the leaderboard\n• Prevent any further trading\n\nAre you sure you want to stop the contest?')) {
       handleAction(
         'stop', 
         () => apiService.stopContest(), 
-        'Contest stopped and all positions squared-off'
+        'Contest stopped. All positions squared-off and results finalized.'
       );
     }
   };
 
-  const handleSpeedChange = async () => {
-    if (speedInput < 0.5 || speedInput > 10) {
-      setMessage('❌ Speed must be between 0.5 and 10');
-      setTimeout(() => setMessage(''), 3000);
-      return;
+  const formatTime = (ms: number) => {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`;
+    } else {
+      return `${seconds}s`;
     }
+  };
 
-    await handleAction(
-      'change speed',
-      () => apiService.setContestSpeed(speedInput),
-      `Speed changed to ${speedInput}x`
-    );
+  const getStatusColor = () => {
+    if (!marketState.isRunning) return 'text-red-400 bg-red-900/30 border-red-700';
+    if (marketState.isPaused) return 'text-yellow-400 bg-yellow-900/30 border-yellow-700';
+    return 'text-green-400 bg-green-900/30 border-green-700';
+  };
+
+  const getStatusText = () => {
+    if (!marketState.isRunning) return 'STOPPED';
+    if (marketState.isPaused) return 'PAUSED';
+    return 'RUNNING';
+  };
+
+  const getStatusIcon = () => {
+    if (!marketState.isRunning) return <Square className="w-4 h-4" />;
+    if (marketState.isPaused) return <Pause className="w-4 h-4" />;
+    return <Play className="w-4 h-4 animate-pulse" />;
   };
 
   return (
-    <div className="bg-gradient-to-r from-yellow-900/30 to-orange-900/30 border border-yellow-700 rounded-lg p-6 mb-4">
+    <div className="bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 border border-gray-700 rounded-lg p-6 mb-6 shadow-2xl">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-3">
           <Settings className="w-6 h-6 text-yellow-400" />
-          <h3 className="text-yellow-400 font-bold text-lg">Admin Controls</h3>
+          <h3 className="text-yellow-400 font-bold text-xl">Admin Control Panel</h3>
         </div>
-        <button
-          onClick={() => setShowAdvanced(!showAdvanced)}
-          className="text-yellow-400 hover:text-yellow-300 text-sm"
-        >
-          {showAdvanced ? 'Basic' : 'Advanced'}
-        </button>
-      </div>
-
-      {/* Contest Status */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 p-4 bg-gray-800/50 rounded-lg">
-        <div className="text-center">
-          <div className={`text-lg font-bold ${
-            marketState.isRunning 
-              ? marketState.isPaused ? 'text-yellow-400' : 'text-green-400'
-              : 'text-red-400'
-          }`}>
-            {marketState.isRunning 
-              ? marketState.isPaused ? 'PAUSED' : 'RUNNING'
-              : 'STOPPED'}
-          </div>
-          <div className="text-xs text-gray-400">Contest Status</div>
-        </div>
-        <div className="text-center">
-          <div className="text-lg font-bold text-white">{marketState.speed}x</div>
-          <div className="text-xs text-gray-400">Speed</div>
-        </div>
-        <div className="text-center">
-          <div className="text-lg font-bold text-white">{marketState.progress.toFixed(1)}%</div>
-          <div className="text-xs text-gray-400">Progress</div>
-        </div>
-        <div className="text-center">
-          <div className="text-lg font-bold text-white">
-            {Math.floor((marketState.elapsedTime || 0) / 60000)}m
-          </div>
-          <div className="text-xs text-gray-400">Elapsed</div>
+        
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setAutoRefresh(!autoRefresh)}
+            className={`p-2 rounded-lg transition-colors ${
+              autoRefresh 
+                ? 'bg-blue-900/30 text-blue-400 border border-blue-700' 
+                : 'bg-gray-700 text-gray-400'
+            }`}
+            title={autoRefresh ? 'Auto-refresh ON' : 'Auto-refresh OFF'}
+          >
+            <RefreshCw className={`w-4 h-4 ${autoRefresh ? 'animate-spin' : ''}`} />
+          </button>
+          
+          <button
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            className="px-3 py-1 bg-gray-700 text-gray-300 rounded-lg hover:bg-gray-600 transition-colors text-sm"
+          >
+            {showAdvanced ? 'Basic' : 'Advanced'} View
+          </button>
         </div>
       </div>
 
-      {/* Primary Controls */}
-      <div className="flex gap-2 flex-wrap mb-4">
+      {/* Contest Status Card */}
+      <div className="bg-gray-800/50 rounded-lg p-6 mb-6">
+        <div className="flex items-center justify-between mb-4">
+          <h4 className="text-gray-300 font-medium">Contest Status</h4>
+          <div className={`px-4 py-2 rounded-full flex items-center gap-2 border ${getStatusColor()}`}>
+            {getStatusIcon()}
+            <span className="font-bold">{getStatusText()}</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="bg-gray-900/50 rounded-lg p-3">
+            <div className="flex items-center gap-2 mb-1">
+              <Clock className="w-4 h-4 text-blue-400" />
+              <span className="text-xs text-gray-400">Progress</span>
+            </div>
+            <div className="text-xl font-bold text-white">{marketState.progress.toFixed(1)}%</div>
+            <div className="w-full bg-gray-700 rounded-full h-1 mt-2">
+              <div 
+                className="bg-blue-500 h-1 rounded-full transition-all duration-500"
+                style={{ width: `${marketState.progress}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="bg-gray-900/50 rounded-lg p-3">
+            <div className="flex items-center gap-2 mb-1">
+              <Zap className="w-4 h-4 text-yellow-400" />
+              <span className="text-xs text-gray-400">Speed</span>
+            </div>
+            <div className="text-xl font-bold text-white">5x</div>
+            <div className="text-xs text-gray-500">Fixed rate</div>
+          </div>
+
+          <div className="bg-gray-900/50 rounded-lg p-3">
+            <div className="flex items-center gap-2 mb-1">
+              <Activity className="w-4 h-4 text-green-400" />
+              <span className="text-xs text-gray-400">Elapsed</span>
+            </div>
+            <div className="text-xl font-bold text-white">
+              {formatTime(marketState.elapsedTime || 0)}
+            </div>
+            <div className="text-xs text-gray-500">Real time</div>
+          </div>
+
+          <div className="bg-gray-900/50 rounded-lg p-3">
+            <div className="flex items-center gap-2 mb-1">
+              <Database className="w-4 h-4 text-purple-400" />
+              <span className="text-xs text-gray-400">Symbols</span>
+            </div>
+            <div className="text-xl font-bold text-white">{marketState.symbols.length}</div>
+            <div className="text-xs text-gray-500">Active stocks</div>
+          </div>
+        </div>
+
+        {marketState.contestStartTime && (
+          <div className="mt-4 pt-4 border-t border-gray-700">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+              <div>
+                <span className="text-gray-400">Started:</span>
+                <span className="text-white ml-2">
+                  {new Date(marketState.contestStartTime).toLocaleString()}
+                </span>
+              </div>
+              <div>
+                <span className="text-gray-400">Will End:</span>
+                <span className="text-white ml-2">
+                  {new Date(new Date(marketState.contestStartTime).getTime() + 3600000).toLocaleString()}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Control Buttons */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <button
           onClick={handleStart}
           disabled={loading || (marketState.isRunning && !marketState.isPaused)}
-          className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors"
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
         >
-          <Play className="w-4 h-4" />
-          {marketState.isPaused ? 'Resume Contest' : 'Start Contest'}
+          <Play className="w-5 h-5" />
+          {marketState.isPaused ? 'Resume' : 'Start'} Contest
         </button>
         
         <button
           onClick={handlePause}
           disabled={loading || !marketState.isRunning || marketState.isPaused}
-          className="flex items-center gap-2 px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 disabled:opacity-50 transition-colors"
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
         >
-          <Pause className="w-4 h-4" />
+          <Pause className="w-5 h-5" />
           Pause
+        </button>
+
+        <button
+          onClick={handleResume}
+          disabled={loading || !marketState.isPaused}
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
+        >
+          <Play className="w-5 h-5" />
+          Resume
         </button>
         
         <button
           onClick={handleStop}
           disabled={loading || !marketState.isRunning}
-          className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
         >
-          <Square className="w-4 h-4" />
+          <Square className="w-5 h-5" />
           Stop & Square-off
         </button>
       </div>
 
-      {/* Speed Control */}
-      <div className="flex items-center gap-3 mb-4">
-        <Zap className="w-5 h-5 text-yellow-400" />
-        <span className="text-yellow-400 font-medium">Speed:</span>
-        <input
-          type="number"
-          min="0.5"
-          max="10"
-          step="0.5"
-          value={speedInput}
-          onChange={(e) => setSpeedInput(parseFloat(e.target.value))}
-          className="w-20 px-2 py-1 bg-gray-800 text-white rounded border border-gray-600 focus:border-yellow-500"
-        />
-        <span className="text-gray-400">x</span>
-        <button
-          onClick={handleSpeedChange}
-          disabled={loading || speedInput === marketState.speed}
-          className="px-3 py-1 bg-yellow-600 text-white rounded hover:bg-yellow-700 disabled:opacity-50 text-sm transition-colors"
-        >
-          Set
-        </button>
-      </div>
-
-      {/* Advanced Controls */}
+      {/* Advanced Status */}
       {showAdvanced && adminStatus && (
-        <div className="border-t border-yellow-700 pt-4">
-          <h4 className="text-yellow-400 font-semibold mb-3 flex items-center gap-2">
-            <BarChart3 className="w-4 h-4" />
-            Advanced Status
+        <div className="border-t border-gray-700 pt-6">
+          <h4 className="text-gray-300 font-semibold mb-4 flex items-center gap-2">
+            <BarChart3 className="w-5 h-5" />
+            Advanced System Status
           </h4>
           
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
-            <div className="bg-gray-800/50 p-3 rounded">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="bg-gray-800/50 p-4 rounded-lg">
               <div className="flex items-center gap-2 mb-2">
                 <Users className="w-4 h-4 text-blue-400" />
                 <span className="text-blue-400 font-medium">Connected Users</span>
               </div>
-              <div className="text-white">{adminStatus.connectedUsers || 0} users</div>
+              <div className="text-2xl font-bold text-white">{adminStatus.connectedUsers || 0}</div>
+              <div className="text-xs text-gray-500 mt-1">Active WebSocket connections</div>
             </div>
             
-            <div className="bg-gray-800/50 p-3 rounded">
-              <div className="text-green-400 font-medium mb-2">Active Symbols</div>
-              <div className="text-white">{adminStatus.symbols?.length || 0} symbols</div>
+            <div className="bg-gray-800/50 p-4 rounded-lg">
+              <div className="flex items-center gap-2 mb-2">
+                <Server className="w-4 h-4 text-green-400" />
+                <span className="text-green-400 font-medium">Memory Usage</span>
+              </div>
+              <div className="text-2xl font-bold text-white">{adminStatus.memoryUsage || 0} MB</div>
+              <div className="text-xs text-gray-500 mt-1">Server heap memory</div>
             </div>
             
-            <div className="bg-gray-800/50 p-3 rounded">
-              <div className="text-purple-400 font-medium mb-2">Data Ticks</div>
-              <div className="text-white">
-                {adminStatus.currentDataTick}/{adminStatus.totalDataTicks}
+            <div className="bg-gray-800/50 p-4 rounded-lg">
+              <div className="flex items-center gap-2 mb-2">
+                <Database className="w-4 h-4 text-purple-400" />
+                <span className="text-purple-400 font-medium">Data Loaded</span>
+              </div>
+              <div className="text-2xl font-bold text-white">
+                {adminStatus.dataLoaded ? '✅ Yes' : '❌ No'}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">
+                {adminStatus.totalDataRows ? `${adminStatus.totalDataRows.toLocaleString()} rows` : 'Not loaded'}
               </div>
             </div>
           </div>
 
-          {/* Symbol Rooms */}
-          {adminStatus.symbolRooms && (
-            <div className="mt-4">
-              <div className="text-yellow-400 font-medium mb-2">Symbol Subscriptions</div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
-                {Object.entries(adminStatus.symbolRooms).map(([symbol, count]: [string, any]) => (
-                  <div key={symbol} className="bg-gray-800/50 p-2 rounded">
-                    <div className="text-white font-medium">{symbol}</div>
-                    <div className="text-gray-400">{count} subscribers</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          {/* Data Information Panel */}
+          <div className="mt-6">
+            <button
+              onClick={() => setShowDataInfo(!showDataInfo)}
+              className="flex items-center gap-2 text-gray-400 hover:text-gray-300 transition-colors mb-4"
+            >
+              <TrendingUp className="w-4 h-4" />
+              <span className="text-sm font-medium">
+                {showDataInfo ? 'Hide' : 'Show'} Data Information
+              </span>
+            </button>
 
-          {/* Contest Timeline */}
-          {marketState.contestStartTime && (
-            <div className="mt-4 p-3 bg-blue-900/20 border border-blue-700 rounded">
-              <div className="text-blue-400 font-medium mb-2">Contest Timeline</div>
-              <div className="text-sm space-y-1">
-                <div className="text-gray-300">
-                  <span className="text-blue-400">Time 0 (Start):</span> {new Date(marketState.contestStartTime).toLocaleString()}
+            {showDataInfo && (
+              <div className="bg-gray-900/50 rounded-lg p-4 space-y-3">
+                <div className="text-sm text-gray-300">
+                  <p className="mb-2">📊 <strong>Data Structure:</strong></p>
+                  <ul className="ml-4 space-y-1 text-gray-400">
+                    <li>• 5 hours of tick-by-tick market data</li>
+                    <li>• Millisecond precision timestamps</li>
+                    <li>• Pre-calculated OHLC for each tick</li>
+                    <li>• {marketState.symbols.length} symbols tracked</li>
+                    <li>• 5x time compression (5hrs → 1hr)</li>
+                  </ul>
                 </div>
-                {marketState.dataStartTime && (
-                  <div className="text-gray-300">
-                    <span className="text-blue-400">Data Start:</span> {new Date(marketState.dataStartTime).toLocaleString()}
-                  </div>
-                )}
-                <div className="text-gray-300">
-                  <span className="text-blue-400">Elapsed:</span> {Math.floor((marketState.elapsedTime || 0) / 60000)}m {Math.floor(((marketState.elapsedTime || 0) % 60000) / 1000)}s
+
+                <div className="text-sm text-gray-300">
+                  <p className="mb-2">🕯️ <strong>Candle Generation:</strong></p>
+                  <ul className="ml-4 space-y-1 text-gray-400">
+                    <li>• Real-time intervals: 1s, 5s, 15s, 30s, 1m, 3m, 5m</li>
+                    <li>• Database windows: 5s, 25s, 75s, 150s, 300s, 900s, 1500s</li>
+                    <li>• OHLC aggregated from tick data</li>
+                    <li>• WebSocket rooms for live updates</li>
+                  </ul>
                 </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       )}
 
-      {/* Status Message */}
+      {/* Status Messages */}
       {message && (
-        <div className={`mt-4 p-3 rounded-lg text-sm ${
-          message.includes('❌') 
-            ? 'bg-red-900/50 text-red-200 border border-red-700' 
-            : 'bg-green-900/50 text-green-200 border border-green-700'
+        <div className={`mt-6 p-4 rounded-lg text-sm border animate-pulse ${
+          messageType === 'error' 
+            ? 'bg-red-900/50 text-red-200 border-red-700' 
+            : messageType === 'warning'
+            ? 'bg-yellow-900/50 text-yellow-200 border-yellow-700'
+            : 'bg-green-900/50 text-green-200 border-green-700'
         }`}>
-          {message}
+          <div className="flex items-center gap-2">
+            {messageType === 'error' && <AlertTriangle className="w-4 h-4" />}
+            {message}
+          </div>
         </div>
       )}
 
       {/* Important Notice */}
-      <div className="mt-4 p-3 bg-orange-900/20 border border-orange-700 rounded-lg">
-        <div className="text-orange-400 font-medium text-sm">⚠️ Important:</div>
-        <ul className="text-orange-200 text-xs mt-1 space-y-1">
-          <li>• Contest automatically stops after 1 hour or when data is exhausted</li>
-          <li>• All short positions are auto squared-off when contest ends</li>
-          <li>• Users joining mid-contest see data from Time 0</li>
-          <li>• Speed changes affect all connected users in real-time</li>
+      <div className="mt-6 p-4 bg-orange-900/20 border border-orange-700 rounded-lg">
+        <div className="flex items-center gap-2 mb-2">
+          <AlertTriangle className="w-5 h-5 text-orange-400" />
+          <span className="text-orange-400 font-medium">Important Information</span>
+        </div>
+        <ul className="text-orange-200 text-sm space-y-1">
+          <li>• Contest runs for exactly 1 hour (simulating 5 hours of market data)</li>
+          <li>• All short positions auto square-off when contest ends</li>
+          <li>• Data streams at 5x speed (5 database seconds = 1 real second)</li>
+          <li>• Users can join mid-contest and see full history from start</li>
+          <li>• Pausing stops candle generation but maintains connection</li>
+          <li>• {marketState.symbols.length} symbols streaming simultaneously</li>
         </ul>
       </div>
     </div>
