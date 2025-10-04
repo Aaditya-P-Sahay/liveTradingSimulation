@@ -50,7 +50,6 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// REDUCED TIMEFRAMES: 5 instead of 7
 const TIMEFRAMES = {
   '5s': { realSeconds: 5, dbSeconds: 25, label: '5 Seconds' },
   '30s': { realSeconds: 30, dbSeconds: 150, label: '30 Seconds' },
@@ -64,12 +63,12 @@ const contestState = {
   isPaused: false,
   contestId: null,
   contestStartTime: null,
-  contestDurationMs: 60 * 60 * 1000, // 1 hour real time
+  contestDurationMs: 60 * 60 * 1000,
   dataStartTimestamp: null,
   dataEndTimestamp: null,
   symbols: [],
   latestPrices: new Map(),
-  timeMapper: null // created on contest start
+  timeMapper: null
 };
 
 const dataLoader = new DataLoader();
@@ -80,20 +79,13 @@ const userSockets = new Map();
 const portfolioCache = new Map();
 let leaderboardCache = [];
 
-// Generate 5s candle (base timeframe)
-// Modified: uses DB window end as candle time, relies on DataLoader pointers (centralized)
-function generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs) {
-  if (!symbol || dataWindowStartMs == null || dataWindowEndMs == null) return null;
+// FIXED: Generate 5s candle with dual timestamps
+function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, dataWindowEndMs) {
+  if (!symbol || universalTime == null || marketTime == null) return null;
 
-  // DataLoader is the single source of pointer truth
   const { ticks } = dataLoader.getTicksInRange(symbol, dataWindowStartMs, dataWindowEndMs);
 
-  // Candle time must be the DB window END (seconds)
-  const candleTime = Math.floor(dataWindowEndMs / 1000);
-
-  // If no ticks in this window: create a carry-forward "empty" candle
   if (!ticks || ticks.length === 0) {
-    // use previous close if present
     const prevCandles = candleAggregator.getCandles(symbol, '5s');
     let prevClose = null;
     if (prevCandles && prevCandles.length > 0) {
@@ -103,7 +95,8 @@ function generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs) {
     }
 
     const emptyCandle = {
-      time: candleTime,
+      time: universalTime,
+      market_time: marketTime,
       open: prevClose,
       high: prevClose,
       low: prevClose,
@@ -115,12 +108,11 @@ function generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs) {
     candleAggregator.storeCandle(symbol, '5s', emptyCandle);
     contestState.latestPrices.set(symbol, emptyCandle.close);
 
-    console.log(`      ⚪ ${symbol} 5s EMPTY @ ${new Date(candleTime * 1000).toISOString()} (carry-forward prevClose=${prevClose})`);
+    console.log(`      ⚪ ${symbol} 5s EMPTY @ ${new Date(marketTime * 1000).toISOString()} (carry-forward prevClose=${prevClose})`);
     return emptyCandle;
   }
 
-  // generate base candle using Aggregator
-  const candle = candleAggregator.generateBaseCandle(ticks, candleTime, symbol);
+  const candle = candleAggregator.generateBaseCandle(ticks, universalTime, marketTime, symbol);
 
   if (candle) {
     candleAggregator.storeCandle(symbol, '5s', candle);
@@ -130,7 +122,7 @@ function generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs) {
   return candle;
 }
 
-// Main candle generation loop
+// FIXED: Main candle generation loop with dual timestamps
 function generateCandlesFor5sInterval() {
   if (!contestState.isRunning || contestState.isPaused) return;
 
@@ -139,37 +131,35 @@ function generateCandlesFor5sInterval() {
     return;
   }
 
-  // elapsed in real contest time (ms)
   const realElapsedMs = Date.now() - contestState.contestStartTime.getTime();
-
+  const intervalNumber = Math.floor(realElapsedMs / 5000);
+  
+  // FIXED: Calculate universal time (contest seconds since start)
+  const universalTime = intervalNumber * 5;  // 0, 5, 10, 15, 20, 25, 30...
+  
   const config = TIMEFRAMES['5s'];
-
-  // Convert contest elapsed -> market offset using timeMapper
-  const universalSeconds = realElapsedMs / 1000; // contest seconds elapsed
-  const marketOffsetSeconds = contestState.timeMapper.universalToMarket(universalSeconds); // seconds into market data
+  const universalSeconds = realElapsedMs / 1000;
+  const marketOffsetSeconds = contestState.timeMapper.universalToMarket(universalSeconds);
   const dataWindowStartMs = contestState.dataStartTimestamp + Math.floor(marketOffsetSeconds * 1000);
   const dataWindowEndMs = dataWindowStartMs + (config.dbSeconds * 1000);
+  const marketTime = Math.floor(dataWindowEndMs / 1000);
 
-  // Check if beyond data
   if (dataWindowStartMs >= contestState.dataEndTimestamp) {
     console.log('⚠️ Reached end of data');
     return;
   }
 
-  // Calculate which 5s interval we're on (for logs)
-  const intervalNumber = Math.floor(realElapsedMs / (config.realSeconds * 1000));
   console.log(`🕯️ Generating 5s candle #${intervalNumber + 1} (DB window ${new Date(dataWindowStartMs).toISOString()} → ${new Date(dataWindowEndMs).toISOString()})`);
 
   let successCount = 0;
   const aggregatedResults = [];
 
   for (const symbol of contestState.symbols) {
-    const candle = generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs);
+    const candle = generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, dataWindowEndMs);
 
     if (candle) {
       successCount++;
 
-      // Emit 5s candle
       io.to(`candles:${symbol}:5s`).emit('candle_update', {
         symbol,
         timeframe: '5s',
@@ -177,10 +167,8 @@ function generateCandlesFor5sInterval() {
         isNew: true
       });
 
-      // Try to aggregate higher timeframes
       const aggregated = candleAggregator.processAggregationCascade(symbol, '5s');
 
-      // Emit aggregated candles
       for (const { timeframe, candle: aggCandle } of aggregated) {
         io.to(`candles:${symbol}:${timeframe}`).emit('candle_update', {
           symbol,
@@ -198,7 +186,6 @@ function generateCandlesFor5sInterval() {
     console.log(`   🔼 Aggregated: ${aggregatedResults.join(', ')}`);
   }
 
-  // Emit market update
   const progress = Math.min((realElapsedMs / contestState.contestDurationMs) * 100, 100);
   io.emit('market_update', {
     currentTime: Date.now(),
@@ -206,24 +193,19 @@ function generateCandlesFor5sInterval() {
     elapsedTime: realElapsedMs
   });
 
-  // Check if need to load next window
   dataLoader.loadNextWindowIfNeeded(dataWindowStartMs);
 }
 
-// Start candle generation
 function startCandleGeneration() {
   console.log('🚀 Starting candle generation (5s base + aggregation)...');
 
-  // Reset caches where necessary
   candleAggregator.clearAll();
 
   const config = TIMEFRAMES['5s'];
   const intervalMs = config.realSeconds * 1000;
 
-  // Generate first candle immediately
   generateCandlesFor5sInterval();
 
-  // Then continue at 5-second intervals
   const intervalId = setInterval(() => {
     generateCandlesFor5sInterval();
   }, intervalMs);
@@ -233,7 +215,6 @@ function startCandleGeneration() {
   console.log('✅ Candle generation started (5s interval)');
 }
 
-// Start contest
 async function startContest() {
   if (contestState.isRunning && !contestState.isPaused) {
     return { success: true, message: 'Contest already running' };
@@ -249,7 +230,6 @@ async function startContest() {
   try {
     console.log('🚀 STARTING NEW CONTEST...');
 
-    // Initialize data loader
     const { symbols, dataStartTime, dataEndTime } = await dataLoader.initialize();
 
     contestState.symbols = symbols;
@@ -263,7 +243,6 @@ async function startContest() {
       throw new Error(`Insufficient data: only ${dataSpanHours.toFixed(2)} hours. Need at least 4 hours.`);
     }
 
-    // Create universal time mapper
     const marketDurationMs = contestState.dataEndTimestamp - contestState.dataStartTimestamp;
     contestState.timeMapper = createUniversalTimeMapper(marketDurationMs, contestState.contestDurationMs);
 
@@ -277,7 +256,7 @@ async function startContest() {
 ========================================
    Contest ID: ${contestState.contestId}
    Duration: 1 hour real-time
-   Speed: ${ (marketDurationMs / contestState.contestDurationMs).toFixed(2) }x compression
+   Speed: ${(marketDurationMs / contestState.contestDurationMs).toFixed(2)}x compression
    Symbols: ${contestState.symbols.join(', ')}
    Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
    Start Time: ${contestState.contestStartTime.toLocaleString()}
@@ -285,7 +264,6 @@ async function startContest() {
 
     startCandleGeneration();
 
-    // Auto-stop after contest duration
     setTimeout(async () => {
       if (contestState.isRunning) {
         console.log('⏰ Contest duration reached - stopping');
@@ -316,7 +294,6 @@ async function startContest() {
   }
 }
 
-// Stop contest
 async function stopContest() {
   if (!contestState.isRunning) {
     return { success: true, message: 'Contest not running' };
@@ -329,7 +306,6 @@ async function stopContest() {
       clearInterval(contestState.candleGenerationInterval);
     }
 
-    // Auto square-off all short positions
     const { data: shortPositions, error: shortError } = await supabaseAdmin
       .from('short_positions')
       .select('*')
@@ -397,12 +373,10 @@ async function stopContest() {
   }
 }
 
-// Get current price
 function getCurrentPrice(symbol) {
   return contestState.latestPrices.get(symbol) || null;
 }
 
-// Authentication middleware
 async function authenticateToken(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -460,7 +434,6 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
-// Portfolio management
 async function getOrCreatePortfolio(userEmail) {
   if (portfolioCache.has(userEmail)) {
     return portfolioCache.get(userEmail);
@@ -811,7 +784,6 @@ function getContestStateForClient() {
     contestDurationMs: contestState.contestDurationMs
   };
 }
-
 // REST API Routes
 app.get('/api/health', (req, res) => {
   const loaderStats = dataLoader.getStats();
@@ -957,7 +929,7 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Price not available for symbol' });
     }
 
-    const companyName = symbol; // Use symbol as company name for now
+    const companyName = symbol;
     const result = await executeTrade(userEmail, symbol, companyName, order_type, quantity, currentPrice);
     await updateLeaderboard();
 
@@ -1031,7 +1003,6 @@ app.get('/api/leaderboard', async (req, res) => {
   res.json(leaderboardCache);
 });
 
-// Admin routes
 app.post('/api/admin/contest/start', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await startContest();
@@ -1202,7 +1173,6 @@ setTimeout(() => {
     '1m': candleAggregator.getCandles('ADANIENT', '1m').length
   });
 }, 30000);
-
 
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {

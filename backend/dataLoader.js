@@ -16,7 +16,7 @@ const BUFFER_MINUTES = 2;
 export class DataLoader {
   constructor() {
     this.loadedWindows = new Map();
-    this.symbolPointers = new Map(); // Track read position for each symbol (centralized pointer)
+    this.symbolPointers = new Map();
     this.windowBoundaries = {
       current: null,
       next: null
@@ -27,21 +27,56 @@ export class DataLoader {
     this.isLoading = false;
   }
 
-  // ✅ initialize: single large select + dedupe (instead of multiple offsets)
   async initialize() {
     console.log('📊 DataLoader: Initializing...');
 
     try {
-      // TRY: Single large query and dedupe.
-      const { data: symbolRows, error: symError } = await supabaseAdmin
-        .from('LALAJI')
-        .select('symbol')
-        .limit(50000);
+      // FIXED: Robust symbol discovery with sampling and deduplication
+      const symbolSet = new Set();
+      let totalRowsFetched = 0;
+      
+      // Sample from multiple offsets to ensure we catch all symbols
+      for (let offsetBatch = 0; offsetBatch < 5; offsetBatch++) {
+        const offset = offsetBatch * 10000;
+        
+        const { data: symbolRows, error: symError } = await supabaseAdmin
+          .from('LALAJI')
+          .select('symbol')
+          .order('timestamp', { ascending: true })
+          .range(offset, offset + 9999);
 
-      if (symError) throw symError;
+        if (symError) {
+          console.error(`❌ Symbol query batch ${offsetBatch} error:`, symError);
+          continue;
+        }
 
-      this.symbols = [...new Set((symbolRows || []).map(row => row.symbol))].filter(Boolean).sort();
+        if (symbolRows && symbolRows.length > 0) {
+          symbolRows.forEach(row => {
+            if (row && row.symbol && typeof row.symbol === 'string') {
+              symbolSet.add(row.symbol.trim());
+            }
+          });
+          totalRowsFetched += symbolRows.length;
+          
+          // Early exit if we've found at least 15 symbols and read enough data
+          if (symbolSet.size >= 15 && totalRowsFetched > 20000) {
+            break;
+          }
+        }
+        
+        // Stop if we got fewer rows than requested (reached end)
+        if (!symbolRows || symbolRows.length < 10000) {
+          break;
+        }
+      }
+
+      this.symbols = Array.from(symbolSet).filter(Boolean).sort();
+      
       console.log(`✅ Found ${this.symbols.length} symbols:`, this.symbols.join(', '));
+      
+      if (this.symbols.length === 0) {
+        throw new Error('No symbols found in database');
+      }
 
       // Get time boundaries
       const { data: timeData, error: timeError } = await supabaseAdmin
@@ -62,7 +97,7 @@ export class DataLoader {
 
       this.dataEndTime = new Date(endData[0].timestamp).getTime();
 
-      console.log(`⏰ Data span: ${new Date(this.dataStartTime).toLocaleString()} to ${new Date(this.dataEndTime).toLocaleString()}`);
+      console.log(`⏰ Data span: ${new Date(this.dataStartTime).toISOString()} to ${new Date(this.dataEndTime).toISOString()}`);
 
       // Load first window
       await this.loadWindow(this.dataStartTime);
@@ -114,7 +149,6 @@ export class DataLoader {
 
         if (!batch || batch.length === 0) break;
 
-        // Process batch
         for (const row of batch) {
           if (!row.symbol) continue;
 
@@ -145,14 +179,14 @@ export class DataLoader {
         }
       }
 
-      // CRITICAL: Reset internal pointers when loading new window
+      // Reset pointers for new window
       this.symbolPointers.clear();
 
-      // Store loaded data and initialize internal pointers
+      // Store loaded data
       for (const [symbol, data] of windowData.entries()) {
         const sortedData = data.sort((a, b) => a.timestamp_ms - b.timestamp_ms);
         this.loadedWindows.set(symbol, sortedData);
-        this.symbolPointers.set(symbol, 0); // initialize internal pointer
+        this.symbolPointers.set(symbol, 0);
         console.log(`   ${symbol}: ${data.length} ticks`);
       }
 
@@ -169,11 +203,6 @@ export class DataLoader {
     }
   }
 
-  /**
-   * Centralized pointer-based tick retrieval (server should NOT maintain raw pointers)
-   *
-   * Returns { ticks: [...], nextPointer: <index> }
-   */
   getTicksInRange(symbol, startTime, endTime) {
     const symbolData = this.loadedWindows.get(symbol);
     if (!symbolData || symbolData.length === 0) {
@@ -184,7 +213,7 @@ export class DataLoader {
     const result = [];
     let i = pointerIndex;
 
-    // Skip to start time (pointer may be before our window)
+    // Skip to start time
     while (i < symbolData.length && symbolData[i].timestamp_ms < startTime) {
       i++;
     }
@@ -195,7 +224,7 @@ export class DataLoader {
       i++;
     }
 
-    // Update pointer to end of this range (centralized)
+    // Update pointer
     this.symbolPointers.set(symbol, i);
 
     return {

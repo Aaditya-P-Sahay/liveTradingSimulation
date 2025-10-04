@@ -3,21 +3,30 @@
 export class CandleAggregator {
   constructor() {
     this.candleCache = new Map();
-    // FIXED: Complete aggregation chain
+    this.lastAggregatedIndex = new Map(); // Track which candles were already aggregated
+    
     this.aggregationConfig = {
       '30s': { from: '5s', count: 6 },
       '1m': { from: '30s', count: 2 },
       '3m': { from: '1m', count: 3 },
       '5m': { from: '1m', count: 5 }
     };
+    
+    this.timeframeRealSeconds = {
+      '5s': 5,
+      '30s': 30,
+      '1m': 60,
+      '3m': 180,
+      '5m': 300
+    };
   }
 
-  // Generate base 5s candle from raw ticks with OHLC logging
-  generateBaseCandle(ticks, timestamp, symbol) {
+  generateBaseCandle(ticks, universalTime, marketTime, symbol) {
     if (!ticks || ticks.length === 0) return null;
 
     const candle = {
-      time: timestamp,
+      time: universalTime,
+      market_time: marketTime,
       open: ticks[0].open,
       high: Math.max(...ticks.map(t => t.high)),
       low: Math.min(...ticks.map(t => t.low)),
@@ -26,7 +35,6 @@ export class CandleAggregator {
       tickCount: ticks.length
     };
 
-    // OHLC LOGGING AS REQUESTED
     console.log(`      💹 ${symbol} 5s: O=${candle.open.toFixed(2)} H=${candle.high.toFixed(2)} L=${candle.low.toFixed(2)} C=${candle.close.toFixed(2)} Vol=${candle.volume} (${ticks.length} ticks)`);
 
     return candle;
@@ -42,7 +50,6 @@ export class CandleAggregator {
     const candles = this.candleCache.get(key);
     candles.push(candle);
 
-    // Keep only last 1000 candles to prevent memory bloat
     if (candles.length > 1000) {
       candles.shift();
     }
@@ -55,32 +62,57 @@ export class CandleAggregator {
     return this.candleCache.get(key) || [];
   }
 
-  // Aggregate higher timeframe candle from lower timeframe candles
+  // FIXED: Track last aggregated position to prevent overlapping aggregations
   tryAggregate(symbol, timeframe) {
     const config = this.aggregationConfig[timeframe];
     if (!config) return null;
 
     const sourceCandles = this.getCandles(symbol, config.from);
+    const trackingKey = `${symbol}:${config.from}→${timeframe}`;
+    
+    // Get last aggregated index (default to -1 if first time)
+    const lastAggregatedIdx = this.lastAggregatedIndex.get(trackingKey) || -1;
+    
+    // We need at least 'count' NEW candles since last aggregation
+    const availableNewCandles = sourceCandles.length - 1 - lastAggregatedIdx;
+    
+    if (availableNewCandles < config.count) {
+      return null; // Not enough new candles yet
+    }
 
-    // Need exactly 'count' candles to aggregate
-    if (sourceCandles.length < config.count) return null;
+    // Get the next batch of 'count' candles starting after last aggregated
+    const startIdx = lastAggregatedIdx + 1;
+    const endIdx = startIdx + config.count;
+    
+    if (endIdx > sourceCandles.length) {
+      return null; // Not enough candles
+    }
 
-    // Take last N candles
-    const candlesToAggregate = sourceCandles.slice(-config.count);
+    const candlesToAggregate = sourceCandles.slice(startIdx, endIdx);
 
-    // Check if they're consecutive (no gaps)
-    const sourceInterval = this.getTimeframeSeconds(config.from);
+    // Validate we have exactly 'count' candles
+    if (candlesToAggregate.length !== config.count) {
+      return null;
+    }
+
+    // Check consecutiveness using universal time
+    const sourceInterval = this.timeframeRealSeconds[config.from];
+    
     for (let i = 1; i < candlesToAggregate.length; i++) {
       const expectedTime = candlesToAggregate[i - 1].time + sourceInterval;
-      // TOLERANCE FIX: use 0.5s tolerance (since times are exact bucket-ends in seconds)
-      if (Math.abs(candlesToAggregate[i].time - expectedTime) > 0.5) {
-        return null; // Gap detected
+      const actualTime = candlesToAggregate[i].time;
+      
+      if (Math.abs(actualTime - expectedTime) > 0.5) {
+        // Gap detected - reset tracking and return null
+        console.log(`      ⚠️ Gap detected in ${symbol} ${config.from} for ${timeframe} aggregation`);
+        return null;
       }
     }
 
     // Aggregate OHLC
     const aggregated = {
       time: candlesToAggregate[candlesToAggregate.length - 1].time,
+      market_time: candlesToAggregate[candlesToAggregate.length - 1].market_time,
       open: candlesToAggregate[0].open,
       high: Math.max(...candlesToAggregate.map(c => c.high)),
       low: Math.min(...candlesToAggregate.map(c => c.low)),
@@ -90,28 +122,18 @@ export class CandleAggregator {
       aggregatedFrom: config.from
     };
 
-    // OHLC LOGGING FOR AGGREGATED CANDLES
-    console.log(`      📊 ${symbol} ${timeframe}: O=${aggregated.open.toFixed(2)} H=${aggregated.high.toFixed(2)} L=${aggregated.low.toFixed(2)} C=${aggregated.close.toFixed(2)} Vol=${aggregated.volume} (from ${config.count}x${config.from})`);
+    // Update last aggregated index to the last candle we just used
+    this.lastAggregatedIndex.set(trackingKey, endIdx - 1);
+
+    console.log(`      📊 ${symbol} ${timeframe}: O=${aggregated.open.toFixed(2)} H=${aggregated.high.toFixed(2)} L=${aggregated.low.toFixed(2)} C=${aggregated.close.toFixed(2)} Vol=${aggregated.volume} (from ${config.count}x${config.from}, indices ${startIdx}-${endIdx-1})`);
 
     return aggregated;
   }
 
-  getTimeframeSeconds(timeframe) {
-    const map = {
-      '5s': 5,
-      '30s': 30,
-      '1m': 60,
-      '3m': 180,
-      '5m': 300
-    };
-    return map[timeframe] || 0;
-  }
-
-  // Process aggregation cascade after base candle is created
   processAggregationCascade(symbol, baseTimeframe) {
     const aggregated = [];
 
-    // Try to aggregate each higher timeframe
+    // Try to aggregate all timeframes that depend on this base
     for (const [timeframe, config] of Object.entries(this.aggregationConfig)) {
       if (config.from === baseTimeframe) {
         const candle = this.tryAggregate(symbol, timeframe);
@@ -134,10 +156,20 @@ export class CandleAggregator {
     for (const tf of timeframes) {
       this.candleCache.delete(`${symbol}:${tf}`);
     }
+    
+    // Clear aggregation tracking for this symbol
+    const keysToDelete = [];
+    for (const key of this.lastAggregatedIndex.keys()) {
+      if (key.startsWith(`${symbol}:`)) {
+        keysToDelete.push(key);
+      }
+    }
+    keysToDelete.forEach(key => this.lastAggregatedIndex.delete(key));
   }
 
   clearAll() {
     this.candleCache.clear();
+    this.lastAggregatedIndex.clear();
   }
 
   getStats() {
@@ -154,7 +186,8 @@ export class CandleAggregator {
     return {
       totalCandles,
       breakdown,
-      memoryMB: Math.round((totalCandles * 80) / 1024 / 1024)
+      memoryMB: Math.round((totalCandles * 80) / 1024 / 1024),
+      aggregationTracking: this.lastAggregatedIndex.size
     };
   }
 }
