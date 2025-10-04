@@ -8,9 +8,7 @@ interface TimeframeSelectorProps {
 }
 
 const TIMEFRAME_OPTIONS = [
-  { key: '1s', label: '1s' },
   { key: '5s', label: '5s' },
-  { key: '15s', label: '15s' },
   { key: '30s', label: '30s' },
   { key: '1m', label: '1m' },
   { key: '3m', label: '3m' },

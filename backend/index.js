@@ -1,3 +1,5 @@
+// backend/index.js
+
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -7,6 +9,9 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import { DataLoader } from './dataLoader.js';
+import { CandleAggregator } from './candleAggregator.js';
+import { createUniversalTimeMapper } from './utils/timeframeUtils.js';
 
 dotenv.config();
 
@@ -45,6 +50,15 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// REDUCED TIMEFRAMES: 5 instead of 7
+const TIMEFRAMES = {
+  '5s': { realSeconds: 5, dbSeconds: 25, label: '5 Seconds' },
+  '30s': { realSeconds: 30, dbSeconds: 150, label: '30 Seconds' },
+  '1m': { realSeconds: 60, dbSeconds: 300, label: '1 Minute' },
+  '3m': { realSeconds: 180, dbSeconds: 900, label: '3 Minutes' },
+  '5m': { realSeconds: 300, dbSeconds: 1500, label: '5 Minutes' }
+};
+
 const contestState = {
   isRunning: false,
   isPaused: false,
@@ -53,313 +67,170 @@ const contestState = {
   contestDurationMs: 60 * 60 * 1000, // 1 hour real time
   dataStartTimestamp: null,
   dataEndTimestamp: null,
-  currentDataTimestamp: null,
   symbols: [],
-  allRawData: new Map(),
-  completedCandles: new Map(),
-  candleGenerationIntervals: new Map(),
-  latestPrices: new Map()
+  latestPrices: new Map(),
+  timeMapper: null // created on contest start
 };
 
-const TIMEFRAMES = {
-  '1s': { realSeconds: 1, dbSeconds: 5, label: '1 Second' },
-  '5s': { realSeconds: 5, dbSeconds: 25, label: '5 Seconds' },
-  '15s': { realSeconds: 15, dbSeconds: 75, label: '15 Seconds' },
-  '30s': { realSeconds: 30, dbSeconds: 150, label: '30 Seconds' },
-  '1m': { realSeconds: 60, dbSeconds: 300, label: '1 Minute' },
-  '3m': { realSeconds: 180, dbSeconds: 900, label: '3 Minutes' },
-  '5m': { realSeconds: 300, dbSeconds: 1500, label: '5 Minutes' }
-};
+const dataLoader = new DataLoader();
+const candleAggregator = new CandleAggregator();
 
 const connectedUsers = new Map();
 const userSockets = new Map();
 const portfolioCache = new Map();
 let leaderboardCache = [];
 
-// FIXED: Load ALL data without limits
-async function loadCompleteDataset() {
-  console.log('📊 Loading COMPLETE dataset from database...');
-  const startTime = Date.now();
-  
-  try {
-    // First get unique symbols WITHOUT LIMIT
-    const { data: symbolRows, error: symbolError } = await supabaseAdmin
-      .from('LALAJI')
-      .select('symbol');  // REMOVED LIMIT
-    
-    if (symbolError) throw symbolError;
-    
-    const uniqueSymbols = [...new Set(symbolRows.map(row => row.symbol))].filter(Boolean);
-    contestState.symbols = uniqueSymbols;
-    
-    console.log(`✅ Found ${uniqueSymbols.length} unique symbols:`, uniqueSymbols.join(', '));
-    
-    // Load ALL data ordered by UID - NO LIMITS!
-    let allDataRows = [];
-    let offset = 0;
-    const batchSize = 50000;
-    let batchCount = 0;
-    
-    console.log('📦 Starting batch loading of ALL data...');
-    
-    while (true) {
-      const { data: batch, error } = await supabaseAdmin
-        .from('LALAJI')
-        .select('*')
-        .order('uid', { ascending: true })
-        .range(offset, offset + batchSize - 1);
-      
-      if (error) {
-        console.error(`Error loading batch at offset ${offset}:`, error);
-        break;
-      }
-      
-      if (!batch || batch.length === 0) {
-        console.log(`✅ No more data at offset ${offset}`);
-        break;
-      }
-      
-      allDataRows = allDataRows.concat(batch);
-      batchCount++;
-      offset += batch.length;
-      
-      console.log(`📦 Batch ${batchCount}: Loaded ${batch.length} rows (Total: ${allDataRows.length})`);
-      
-      // Continue loading until we get less than a full batch
-      if (batch.length < batchSize) {
-        console.log(`✅ Last batch loaded (${batch.length} rows)`);
-        break;
-      }
-    }
-    
-    console.log(`✅ Loaded ${allDataRows.length} total rows from database in ${batchCount} batches`);
-    
-    if (allDataRows.length < 100000) {
-      console.warn(`⚠️ WARNING: Only ${allDataRows.length} rows loaded. Expected ~430,000 rows!`);
-      console.warn(`⚠️ This will cause candles to stop generating after a few seconds!`);
-    }
-    
-    // Parse timestamps and organize by symbol
-    contestState.allRawData.clear();
-    let earliestTime = null;
-    let latestTime = null;
-    
-    for (const symbol of uniqueSymbols) {
-      contestState.allRawData.set(symbol, []);
-    }
-    
-    // Process each row
-    for (const row of allDataRows) {
-      if (!row.symbol || !row.timestamp) continue;
-      
-      const timestamp = new Date(row.timestamp).getTime();
-      
-      if (!earliestTime || timestamp < earliestTime) earliestTime = timestamp;
-      if (!latestTime || timestamp > latestTime) latestTime = timestamp;
-      
-      const symbolData = contestState.allRawData.get(row.symbol);
-      if (symbolData) {
-        symbolData.push({
-          ...row,
-          timestamp_ms: timestamp,
-          db_open: parseFloat(row.open_price) || parseFloat(row.last_traded_price),
-          db_high: parseFloat(row.high_price) || parseFloat(row.last_traded_price),
-          db_low: parseFloat(row.low_price) || parseFloat(row.last_traded_price),
-          db_close: parseFloat(row.close_price) || parseFloat(row.last_traded_price),
-          last_price: parseFloat(row.last_traded_price),
-          volume: parseInt(row.volume_traded) || 0
-        });
-      }
-    }
-    
-    // Sort each symbol's data by timestamp
-    for (const [symbol, data] of contestState.allRawData.entries()) {
-      data.sort((a, b) => a.timestamp_ms - b.timestamp_ms);
-      console.log(`   - ${symbol}: ${data.length} ticks`);
-    }
-    
-    // Set data boundaries
-    contestState.dataStartTimestamp = earliestTime;
-    contestState.dataEndTimestamp = earliestTime + (5 * 60 * 60 * 1000); // 5 hours of data
-    contestState.currentDataTimestamp = earliestTime;
-    
-    const dataSpanMs = latestTime - earliestTime;
-    const dataSpanHours = dataSpanMs / (1000 * 60 * 60);
-    const dataSpanMinutes = (dataSpanMs / (1000 * 60)) % 60;
-    
-    const loadTime = Date.now() - startTime;
-    console.log(`
-🎯 DATA LOADING COMPLETE in ${loadTime}ms:
-========================================
-   Symbols: ${uniqueSymbols.length}
-   Total rows: ${allDataRows.length}
-   Data span: ${dataSpanHours.toFixed(0)}h ${dataSpanMinutes.toFixed(0)}m
-   Start: ${new Date(earliestTime).toLocaleString()}
-   End: ${new Date(latestTime).toLocaleString()}
-   Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB
-========================================`);
-    
-    if (dataSpanHours < 4) {
-      console.error(`
-❌ CRITICAL ERROR: Insufficient data!
-   Expected: 5 hours of market data
-   Found: ${dataSpanHours.toFixed(2)} hours
-   This will cause contest to fail!
-`);
-    }
-    
-    return true;
-    
-  } catch (error) {
-    console.error('❌ Failed to load dataset:', error);
-    return false;
-  }
-}
+// Generate 5s candle (base timeframe)
+// Modified: uses DB window end as candle time, relies on DataLoader pointers (centralized)
+function generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs) {
+  if (!symbol || dataWindowStartMs == null || dataWindowEndMs == null) return null;
 
-// Generate candle from database OHLC
-function generateCandleFromDatabaseOHLC(symbol, dataStartTime, dataEndTime) {
-  const symbolData = contestState.allRawData.get(symbol);
-  if (!symbolData || symbolData.length === 0) return null;
-  
-  // Find all occurrences within the time window
-  const windowData = symbolData.filter(row => 
-    row.timestamp_ms >= dataStartTime && row.timestamp_ms < dataEndTime
-  );
-  
-  if (windowData.length === 0) return null;
-  
-  // EXACTLY AS SPECIFIED:
-  const firstOccurrence = windowData[0];
-  const lastOccurrence = windowData[windowData.length - 1];
-  
-  const candle = {
-    time: Math.floor(Date.now() / 1000),
-    open: firstOccurrence.db_open,
-    high: Math.max(...windowData.map(w => w.db_high)),
-    low: Math.min(...windowData.map(w => w.db_low)),
-    close: lastOccurrence.db_close,
-    volume: windowData.reduce((sum, w) => sum + w.volume, 0),
-    tickCount: windowData.length
-  };
-  
+  // DataLoader is the single source of pointer truth
+  const { ticks } = dataLoader.getTicksInRange(symbol, dataWindowStartMs, dataWindowEndMs);
+
+  // Candle time must be the DB window END (seconds)
+  const candleTime = Math.floor(dataWindowEndMs / 1000);
+
+  // If no ticks in this window: create a carry-forward "empty" candle
+  if (!ticks || ticks.length === 0) {
+    // use previous close if present
+    const prevCandles = candleAggregator.getCandles(symbol, '5s');
+    let prevClose = null;
+    if (prevCandles && prevCandles.length > 0) {
+      prevClose = prevCandles[prevCandles.length - 1].close;
+    } else {
+      prevClose = contestState.latestPrices.get(symbol) || 0;
+    }
+
+    const emptyCandle = {
+      time: candleTime,
+      open: prevClose,
+      high: prevClose,
+      low: prevClose,
+      close: prevClose,
+      volume: 0,
+      tickCount: 0
+    };
+
+    candleAggregator.storeCandle(symbol, '5s', emptyCandle);
+    contestState.latestPrices.set(symbol, emptyCandle.close);
+
+    console.log(`      ⚪ ${symbol} 5s EMPTY @ ${new Date(candleTime * 1000).toISOString()} (carry-forward prevClose=${prevClose})`);
+    return emptyCandle;
+  }
+
+  // generate base candle using Aggregator
+  const candle = candleAggregator.generateBaseCandle(ticks, candleTime, symbol);
+
+  if (candle) {
+    candleAggregator.storeCandle(symbol, '5s', candle);
+    contestState.latestPrices.set(symbol, candle.close);
+  }
+
   return candle;
 }
 
-// Generate candles for timeframe
-function generateCandlesForTimeframe(timeframeName, config) {
+// Main candle generation loop
+function generateCandlesFor5sInterval() {
   if (!contestState.isRunning || contestState.isPaused) return;
-  
-  const realElapsedMs = Date.now() - contestState.contestStartTime.getTime();
-  
-  // Calculate which database time window we need
-  const candleNumber = Math.floor(realElapsedMs / (config.realSeconds * 1000));
-  const dataWindowStartMs = contestState.dataStartTimestamp + (candleNumber * config.dbSeconds * 1000);
-  const dataWindowEndMs = dataWindowStartMs + (config.dbSeconds * 1000);
-  
-  // Check if we've exceeded our data
-  if (dataWindowStartMs >= contestState.dataEndTimestamp) {
-    console.log(`⚠️ No more data for ${timeframeName} candles - reached end of dataset`);
+
+  if (!contestState.contestStartTime || !contestState.timeMapper) {
+    console.warn('Contest start time or time mapper not initialized');
     return;
   }
-  
-  // Also check against actual data end
-  let actualDataEnd = 0;
-  for (const [symbol, data] of contestState.allRawData.entries()) {
-    if (data.length > 0) {
-      const lastTick = data[data.length - 1];
-      if (lastTick.timestamp_ms > actualDataEnd) {
-        actualDataEnd = lastTick.timestamp_ms;
+
+  // elapsed in real contest time (ms)
+  const realElapsedMs = Date.now() - contestState.contestStartTime.getTime();
+
+  const config = TIMEFRAMES['5s'];
+
+  // Convert contest elapsed -> market offset using timeMapper
+  const universalSeconds = realElapsedMs / 1000; // contest seconds elapsed
+  const marketOffsetSeconds = contestState.timeMapper.universalToMarket(universalSeconds); // seconds into market data
+  const dataWindowStartMs = contestState.dataStartTimestamp + Math.floor(marketOffsetSeconds * 1000);
+  const dataWindowEndMs = dataWindowStartMs + (config.dbSeconds * 1000);
+
+  // Check if beyond data
+  if (dataWindowStartMs >= contestState.dataEndTimestamp) {
+    console.log('⚠️ Reached end of data');
+    return;
+  }
+
+  // Calculate which 5s interval we're on (for logs)
+  const intervalNumber = Math.floor(realElapsedMs / (config.realSeconds * 1000));
+  console.log(`🕯️ Generating 5s candle #${intervalNumber + 1} (DB window ${new Date(dataWindowStartMs).toISOString()} → ${new Date(dataWindowEndMs).toISOString()})`);
+
+  let successCount = 0;
+  const aggregatedResults = [];
+
+  for (const symbol of contestState.symbols) {
+    const candle = generate5sCandle(symbol, dataWindowStartMs, dataWindowEndMs);
+
+    if (candle) {
+      successCount++;
+
+      // Emit 5s candle
+      io.to(`candles:${symbol}:5s`).emit('candle_update', {
+        symbol,
+        timeframe: '5s',
+        candle,
+        isNew: true
+      });
+
+      // Try to aggregate higher timeframes
+      const aggregated = candleAggregator.processAggregationCascade(symbol, '5s');
+
+      // Emit aggregated candles
+      for (const { timeframe, candle: aggCandle } of aggregated) {
+        io.to(`candles:${symbol}:${timeframe}`).emit('candle_update', {
+          symbol,
+          timeframe,
+          candle: aggCandle,
+          isNew: true
+        });
+        aggregatedResults.push(`${symbol}:${timeframe}`);
       }
     }
   }
-  
-  if (dataWindowStartMs >= actualDataEnd) {
-    console.log(`⚠️ No more data for ${timeframeName} - exceeded actual data (${new Date(actualDataEnd).toLocaleTimeString()})`);
-    return;
+
+  console.log(`   ✅ Generated ${successCount} 5s candles`);
+  if (aggregatedResults.length > 0) {
+    console.log(`   🔼 Aggregated: ${aggregatedResults.join(', ')}`);
   }
-  
-  console.log(`🕯️ Generating ${timeframeName} candle #${candleNumber + 1}`);
-  console.log(`   Database window: ${new Date(dataWindowStartMs).toLocaleTimeString()} to ${new Date(dataWindowEndMs).toLocaleTimeString()}`);
-  
-  let successCount = 0;
-  let failCount = 0;
-  
-  for (const symbol of contestState.symbols) {
-    const candle = generateCandleFromDatabaseOHLC(symbol, dataWindowStartMs, dataWindowEndMs);
-    
-    if (candle) {
-      const key = `${symbol}:${timeframeName}`;
-      const candles = contestState.completedCandles.get(key) || [];
-      candles.push(candle);
-      contestState.completedCandles.set(key, candles);
-      
-      contestState.latestPrices.set(symbol, candle.close);
-      
-      // Emit to WebSocket room
-      io.to(`candles:${symbol}:${timeframeName}`).emit('candle_update', {
-        symbol,
-        timeframe: timeframeName,
-        candle,
-        candleNumber: candles.length,
-        isNew: true
-      });
-      
-      successCount++;
-    } else {
-      failCount++;
-      console.log(`   ⚠️ No data for ${symbol} in this window`);
-    }
-  }
-  
-  console.log(`   ✅ Generated ${successCount} candles, ${failCount} symbols had no data`);
-  
-  // Emit market-wide update
+
+  // Emit market update
   const progress = Math.min((realElapsedMs / contestState.contestDurationMs) * 100, 100);
   io.emit('market_update', {
     currentTime: Date.now(),
     progress,
-    elapsedTime: realElapsedMs,
-    timeframe: timeframeName,
-    candlesGenerated: successCount
+    elapsedTime: realElapsedMs
   });
+
+  // Check if need to load next window
+  dataLoader.loadNextWindowIfNeeded(dataWindowStartMs);
 }
 
 // Start candle generation
 function startCandleGeneration() {
-  console.log('🚀 Starting real-time candle generation...');
-  
-  // Clear any existing intervals
-  for (const [timeframe, intervalId] of contestState.candleGenerationIntervals) {
-    clearInterval(intervalId);
-  }
-  contestState.candleGenerationIntervals.clear();
-  
-  // Initialize candle storage
-  for (const symbol of contestState.symbols) {
-    for (const timeframe of Object.keys(TIMEFRAMES)) {
-      const key = `${symbol}:${timeframe}`;
-      contestState.completedCandles.set(key, []);
-    }
-  }
-  
-  // Start intervals for each timeframe
-  for (const [timeframeName, config] of Object.entries(TIMEFRAMES)) {
-    const intervalMs = config.realSeconds * 1000;
-    
-    console.log(`⏰ Starting ${timeframeName} interval: every ${config.realSeconds} seconds`);
-    
-    // Generate first candle immediately
-    generateCandlesForTimeframe(timeframeName, config);
-    
-    // Then continue at intervals
-    const intervalId = setInterval(() => {
-      generateCandlesForTimeframe(timeframeName, config);
-    }, intervalMs);
-    
-    contestState.candleGenerationIntervals.set(timeframeName, intervalId);
-  }
-  
-  console.log('✅ Candle generation started for all timeframes');
+  console.log('🚀 Starting candle generation (5s base + aggregation)...');
+
+  // Reset caches where necessary
+  candleAggregator.clearAll();
+
+  const config = TIMEFRAMES['5s'];
+  const intervalMs = config.realSeconds * 1000;
+
+  // Generate first candle immediately
+  generateCandlesFor5sInterval();
+
+  // Then continue at 5-second intervals
+  const intervalId = setInterval(() => {
+    generateCandlesFor5sInterval();
+  }, intervalMs);
+
+  contestState.candleGenerationInterval = intervalId;
+
+  console.log('✅ Candle generation started (5s interval)');
 }
 
 // Start contest
@@ -377,50 +248,51 @@ async function startContest() {
 
   try {
     console.log('🚀 STARTING NEW CONTEST...');
-    
-    // Load ALL data
-    const dataLoaded = await loadCompleteDataset();
-    if (!dataLoaded) {
-      throw new Error('Failed to load market data - check database connection');
+
+    // Initialize data loader
+    const { symbols, dataStartTime, dataEndTime } = await dataLoader.initialize();
+
+    contestState.symbols = symbols;
+    contestState.dataStartTimestamp = dataStartTime;
+    contestState.dataEndTimestamp = dataEndTime;
+
+    const dataSpanHours = (dataEndTime - dataStartTime) / (1000 * 60 * 60);
+    console.log(`✅ Data loaded: ${dataSpanHours.toFixed(2)} hours of market data`);
+
+    if (dataSpanHours < 4) {
+      throw new Error(`Insufficient data: only ${dataSpanHours.toFixed(2)} hours. Need at least 4 hours.`);
     }
-    
-    // Check if we have enough data
-    let totalDataPoints = 0;
-    for (const [symbol, data] of contestState.allRawData.entries()) {
-      totalDataPoints += data.length;
-    }
-    
-    if (totalDataPoints < 100000) {
-      console.error(`❌ Insufficient data: only ${totalDataPoints} data points loaded!`);
-      throw new Error(`Insufficient data: only ${totalDataPoints} rows. Need at least 100,000 rows for contest.`);
-    }
-    
+
+    // Create universal time mapper
+    const marketDurationMs = contestState.dataEndTimestamp - contestState.dataStartTimestamp;
+    contestState.timeMapper = createUniversalTimeMapper(marketDurationMs, contestState.contestDurationMs);
+
     contestState.isRunning = true;
     contestState.isPaused = false;
     contestState.contestId = crypto.randomUUID();
     contestState.contestStartTime = new Date();
-    
+
     console.log(`
 📊 CONTEST STARTED:
 ========================================
    Contest ID: ${contestState.contestId}
    Duration: 1 hour real-time
-   Speed: 5x (5 hours market data)
+   Speed: ${ (marketDurationMs / contestState.contestDurationMs).toFixed(2) }x compression
    Symbols: ${contestState.symbols.join(', ')}
-   Data Points: ${totalDataPoints}
+   Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
    Start Time: ${contestState.contestStartTime.toLocaleString()}
 ========================================`);
-    
+
     startCandleGeneration();
-    
-    // Auto-stop after 1 hour
+
+    // Auto-stop after contest duration
     setTimeout(async () => {
       if (contestState.isRunning) {
         console.log('⏰ Contest duration reached - stopping');
         await stopContest();
       }
     }, contestState.contestDurationMs);
-    
+
     io.emit('contest_started', {
       message: 'Contest started!',
       contestId: contestState.contestId,
@@ -429,14 +301,14 @@ async function startContest() {
       duration: contestState.contestDurationMs,
       timeframes: Object.keys(TIMEFRAMES)
     });
-    
+
     return {
       success: true,
       message: 'Contest started successfully',
       contestId: contestState.contestId,
       symbols: contestState.symbols
     };
-    
+
   } catch (error) {
     console.error('❌ Failed to start contest:', error);
     contestState.isRunning = false;
@@ -444,7 +316,7 @@ async function startContest() {
   }
 }
 
-// Stop contest and auto square-off
+// Stop contest
 async function stopContest() {
   if (!contestState.isRunning) {
     return { success: true, message: 'Contest not running' };
@@ -452,29 +324,28 @@ async function stopContest() {
 
   try {
     console.log('🛑 Stopping contest...');
-    
-    for (const [timeframe, intervalId] of contestState.candleGenerationIntervals) {
-      clearInterval(intervalId);
+
+    if (contestState.candleGenerationInterval) {
+      clearInterval(contestState.candleGenerationInterval);
     }
-    contestState.candleGenerationIntervals.clear();
-    
+
     // Auto square-off all short positions
     const { data: shortPositions, error: shortError } = await supabaseAdmin
       .from('short_positions')
       .select('*')
       .eq('is_active', true);
-    
+
     if (!shortError && shortPositions) {
       for (const short of shortPositions) {
         const currentPrice = contestState.latestPrices.get(short.symbol) || short.avg_short_price;
         const pnl = (short.avg_short_price - currentPrice) * short.quantity;
-        
+
         const { data: portfolio } = await supabaseAdmin
           .from('portfolio')
           .select('*')
           .eq('user_email', short.user_email)
           .single();
-        
+
         if (portfolio) {
           await supabaseAdmin
             .from('portfolio')
@@ -484,12 +355,12 @@ async function stopContest() {
             })
             .eq('user_email', short.user_email);
         }
-        
+
         await supabaseAdmin
           .from('short_positions')
           .update({ is_active: false })
           .eq('id', short.id);
-        
+
         await supabaseAdmin
           .from('trades')
           .insert({
@@ -503,23 +374,23 @@ async function stopContest() {
             timestamp: new Date().toISOString()
           });
       }
-      
+
       console.log(`✅ Auto squared-off ${shortPositions.length} short positions`);
     }
-    
+
     await updateLeaderboard();
-    
+
     contestState.isRunning = false;
     contestState.isPaused = false;
-    
+
     io.emit('contest_ended', {
       message: 'Contest ended',
       contestId: contestState.contestId,
       finalLeaderboard: leaderboardCache.slice(0, 10)
     });
-    
+
     return { success: true, message: 'Contest stopped successfully' };
-    
+
   } catch (error) {
     console.error('❌ Error stopping contest:', error);
     return { success: false, message: error.message };
@@ -542,7 +413,7 @@ async function authenticateToken(req, res, next) {
     }
 
     const { data: { user }, error } = await supabase.auth.getUser(token);
-    
+
     if (error || !user) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
@@ -559,7 +430,7 @@ async function authenticateToken(req, res, next) {
         .select('*')
         .eq("Candidate's Email", user.email)
         .single();
-      
+
       if (emailData) {
         await supabaseAdmin
           .from('users')
@@ -589,12 +460,12 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
-// Portfolio management functions
+// Portfolio management
 async function getOrCreatePortfolio(userEmail) {
   if (portfolioCache.has(userEmail)) {
     return portfolioCache.get(userEmail);
   }
-  
+
   try {
     let { data: portfolio, error } = await supabaseAdmin
       .from('portfolio')
@@ -650,7 +521,7 @@ async function updatePortfolioValues(userEmail) {
         const positionValue = currentPrice * position.quantity;
         longMarketValue += positionValue;
         longUnrealizedPnl += (currentPrice - position.avg_price) * position.quantity;
-        
+
         holdings[symbol] = {
           ...position,
           current_price: currentPrice,
@@ -690,12 +561,12 @@ async function updatePortfolioValues(userEmail) {
     };
 
     portfolioCache.set(userEmail, updatedPortfolio);
-    
+
     await supabaseAdmin
       .from('portfolio')
       .update(updatedPortfolio)
       .eq('user_email', userEmail);
-    
+
     io.to(`user:${userEmail}`).emit('portfolio_update', updatedPortfolio);
 
     return updatedPortfolio;
@@ -713,12 +584,12 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
 
     const totalAmount = price * quantity;
     const portfolio = await getOrCreatePortfolio(userEmail);
-    
+
     if (orderType === 'buy') {
       if (portfolio.cash_balance < totalAmount) {
         throw new Error('Insufficient cash balance');
       }
-      
+
       const holdings = portfolio.holdings || {};
       if (holdings[symbol]) {
         const newQuantity = holdings[symbol].quantity + quantity;
@@ -738,11 +609,11 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           unrealized_pnl: 0
         };
       }
-      
+
       portfolio.cash_balance -= totalAmount;
       portfolio.holdings = holdings;
       portfolioCache.set(userEmail, portfolio);
-      
+
       await supabaseAdmin
         .from('portfolio')
         .update({
@@ -750,27 +621,27 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           holdings
         })
         .eq('user_email', userEmail);
-        
+
     } else if (orderType === 'sell') {
       const holdings = portfolio.holdings || {};
-      
+
       if (!holdings[symbol] || holdings[symbol].quantity < quantity) {
         throw new Error('Insufficient holdings to sell');
       }
-      
+
       const position = holdings[symbol];
       const realizedPnl = (price - position.avg_price) * quantity;
-      
+
       holdings[symbol].quantity -= quantity;
       if (holdings[symbol].quantity === 0) {
         delete holdings[symbol];
       }
-      
+
       portfolio.cash_balance += totalAmount;
       portfolio.holdings = holdings;
       portfolio.realized_pnl = (portfolio.realized_pnl || 0) + realizedPnl;
       portfolioCache.set(userEmail, portfolio);
-      
+
       await supabaseAdmin
         .from('portfolio')
         .update({
@@ -779,7 +650,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           realized_pnl: portfolio.realized_pnl
         })
         .eq('user_email', userEmail);
-        
+
     } else if (orderType === 'short_sell') {
       await supabaseAdmin
         .from('short_positions')
@@ -794,15 +665,15 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           is_active: true,
           opened_at: new Date().toISOString()
         });
-      
+
       portfolio.cash_balance += totalAmount;
       portfolioCache.set(userEmail, portfolio);
-      
+
       await supabaseAdmin
         .from('portfolio')
         .update({ cash_balance: portfolio.cash_balance })
         .eq('user_email', userEmail);
-        
+
     } else if (orderType === 'buy_to_cover') {
       const { data: shorts } = await supabaseAdmin
         .from('short_positions')
@@ -811,21 +682,21 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         .eq('symbol', symbol)
         .eq('is_active', true)
         .order('opened_at', { ascending: true });
-      
+
       if (!shorts || shorts.length === 0) {
         throw new Error('No short positions to cover');
       }
-      
+
       let remainingQuantity = quantity;
       let totalPnl = 0;
-      
+
       for (const short of shorts) {
         if (remainingQuantity <= 0) break;
-        
+
         const coverQuantity = Math.min(remainingQuantity, short.quantity);
         const pnl = (short.avg_short_price - price) * coverQuantity;
         totalPnl += pnl;
-        
+
         if (coverQuantity === short.quantity) {
           await supabaseAdmin
             .from('short_positions')
@@ -837,14 +708,14 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
             .update({ quantity: short.quantity - coverQuantity })
             .eq('id', short.id);
         }
-        
+
         remainingQuantity -= coverQuantity;
       }
-      
+
       portfolio.cash_balance -= totalAmount;
       portfolio.realized_pnl = (portfolio.realized_pnl || 0) + totalPnl;
       portfolioCache.set(userEmail, portfolio);
-      
+
       await supabaseAdmin
         .from('portfolio')
         .update({
@@ -853,7 +724,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         })
         .eq('user_email', userEmail);
     }
-    
+
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
       .insert({
@@ -920,14 +791,14 @@ async function updateLeaderboard() {
 }
 
 function getContestStateForClient() {
-  const elapsedTime = contestState.contestStartTime 
-    ? Date.now() - contestState.contestStartTime.getTime() 
+  const elapsedTime = contestState.contestStartTime
+    ? Date.now() - contestState.contestStartTime.getTime()
     : 0;
-  
-  const progress = contestState.contestStartTime 
+
+  const progress = contestState.contestStartTime
     ? Math.min((elapsedTime / contestState.contestDurationMs) * 100, 100)
     : 0;
-    
+
   return {
     isRunning: contestState.isRunning,
     isPaused: contestState.isPaused,
@@ -943,6 +814,9 @@ function getContestStateForClient() {
 
 // REST API Routes
 app.get('/api/health', (req, res) => {
+  const loaderStats = dataLoader.getStats();
+  const aggregatorStats = candleAggregator.getStats();
+
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -950,14 +824,16 @@ app.get('/api/health', (req, res) => {
     contestState: getContestStateForClient(),
     uptime: process.uptime(),
     activeSymbols: contestState.symbols.length,
-    memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+    dataLoader: loaderStats,
+    candleAggregator: aggregatorStats,
+    totalMemoryMB: loaderStats.memoryMB + aggregatorStats.memoryMB
   });
 });
 
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    
+
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
@@ -983,7 +859,7 @@ app.post('/api/auth/login', async (req, res) => {
         .select('*')
         .eq("Candidate's Email", email)
         .single();
-      
+
       if (emailData) {
         await supabaseAdmin
           .from('users')
@@ -1047,10 +923,9 @@ app.get('/api/candlestick/:symbol', (req, res) => {
   try {
     const { symbol } = req.params;
     const timeframe = req.query.timeframe || '30s';
-    
-    const key = `${symbol}:${timeframe}`;
-    const candles = contestState.completedCandles.get(key) || [];
-    
+
+    const candles = candleAggregator.getCandles(symbol, timeframe);
+
     res.json({
       symbol,
       timeframe,
@@ -1082,7 +957,7 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Price not available for symbol' });
     }
 
-    const companyName = contestState.allRawData.get(symbol)?.[0]?.company_name || symbol;
+    const companyName = symbol; // Use symbol as company name for now
     const result = await executeTrade(userEmail, symbol, companyName, order_type, quantity, currentPrice);
     await updateLeaderboard();
 
@@ -1132,19 +1007,19 @@ app.get('/api/shorts', authenticateToken, async (req, res) => {
   try {
     const userEmail = req.user["Candidate's Email"];
     const activeOnly = req.query.active === 'true';
-    
+
     let query = supabaseAdmin
       .from('short_positions')
       .select('*')
       .eq('user_email', userEmail)
       .order('opened_at', { ascending: false });
-    
+
     if (activeOnly) {
       query = query.eq('is_active', true);
     }
-    
+
     const { data: shorts, error } = await query;
-    
+
     if (error) throw error;
     res.json({ shorts: shorts || [], count: shorts?.length || 0 });
   } catch (error) {
@@ -1184,13 +1059,13 @@ app.post('/api/admin/contest/pause', authenticateToken, requireAdmin, async (req
     if (!contestState.isRunning) {
       return res.status(400).json({ error: 'Contest not running' });
     }
-    
+
     contestState.isPaused = true;
-    
-    for (const [timeframe, intervalId] of contestState.candleGenerationIntervals) {
-      clearInterval(intervalId);
+
+    if (contestState.candleGenerationInterval) {
+      clearInterval(contestState.candleGenerationInterval);
     }
-    
+
     io.emit('contest_paused', { message: 'Contest paused' });
     res.json({ success: true, message: 'Contest paused' });
   } catch (error) {
@@ -1203,10 +1078,10 @@ app.post('/api/admin/contest/resume', authenticateToken, requireAdmin, async (re
     if (!contestState.isRunning || !contestState.isPaused) {
       return res.status(400).json({ error: 'Contest not paused' });
     }
-    
+
     contestState.isPaused = false;
     startCandleGeneration();
-    
+
     io.emit('contest_resumed', { message: 'Contest resumed' });
     res.json({ success: true, message: 'Contest resumed' });
   } catch (error) {
@@ -1215,37 +1090,35 @@ app.post('/api/admin/contest/resume', authenticateToken, requireAdmin, async (re
 });
 
 app.get('/api/admin/contest/status', authenticateToken, requireAdmin, (req, res) => {
-  let totalDataRows = 0;
-  for (const [symbol, data] of contestState.allRawData.entries()) {
-    totalDataRows += data.length;
-  }
-  
+  const loaderStats = dataLoader.getStats();
+  const aggregatorStats = candleAggregator.getStats();
+
   res.json({
     ...getContestStateForClient(),
     connectedUsers: connectedUsers.size,
-    memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-    totalDataRows,
-    dataLoaded: contestState.allRawData.size > 0
+    dataLoader: loaderStats,
+    candleAggregator: aggregatorStats,
+    totalMemoryMB: loaderStats.memoryMB + aggregatorStats.memoryMB
   });
 });
 
 // WebSocket handlers
 io.on('connection', (socket) => {
   console.log(`👤 User connected: ${socket.id}`);
-  
+
   socket.emit('contest_state', getContestStateForClient());
 
   socket.on('authenticate', async (token) => {
     try {
       const { data: { user }, error } = await supabase.auth.getUser(token);
-      
+
       if (!error && user) {
         let { data: userData } = await supabaseAdmin
           .from('users')
           .select('*')
           .eq('auth_id', user.id)
           .single();
-        
+
         if (!userData) {
           const { data: emailData } = await supabaseAdmin
             .from('users')
@@ -1254,19 +1127,19 @@ io.on('connection', (socket) => {
             .single();
           userData = emailData;
         }
-        
+
         if (userData) {
           const userEmail = userData["Candidate's Email"];
-          
+
           connectedUsers.set(socket.id, {
             email: userEmail,
             name: userData["Candidate's Name"],
             role: userData.role
           });
-          
+
           userSockets.set(userEmail, socket.id);
           socket.join(`user:${userEmail}`);
-          
+
           socket.emit('authenticated', {
             success: true,
             user: {
@@ -1275,7 +1148,7 @@ io.on('connection', (socket) => {
               role: userData.role
             }
           });
-          
+
           console.log(`✅ User authenticated: ${userEmail}`);
         }
       }
@@ -1288,10 +1161,9 @@ io.on('connection', (socket) => {
     const room = `candles:${symbol}:${timeframe}`;
     socket.join(room);
     console.log(`📊 ${socket.id} subscribed to ${room}`);
-    
-    const key = `${symbol}:${timeframe}`;
-    const candles = contestState.completedCandles.get(key) || [];
-    
+
+    const candles = candleAggregator.getCandles(symbol, timeframe);
+
     socket.emit('initial_candles', {
       symbol,
       timeframe,
@@ -1306,37 +1178,9 @@ io.on('connection', (socket) => {
     console.log(`📊 ${socket.id} unsubscribed from ${room}`);
   });
 
-  socket.on('join_symbol', (symbol) => {
-    for (const timeframe of Object.keys(TIMEFRAMES)) {
-      socket.join(`candles:${symbol}:${timeframe}`);
-    }
-    
-    console.log(`📈 ${socket.id} joined all timeframes for ${symbol}`);
-    
-    const response = {
-      symbol,
-      timeframes: {},
-      contestState: getContestStateForClient()
-    };
-    
-    for (const timeframe of Object.keys(TIMEFRAMES)) {
-      const key = `${symbol}:${timeframe}`;
-      response.timeframes[timeframe] = contestState.completedCandles.get(key) || [];
-    }
-    
-    socket.emit('symbol_data', response);
-  });
-
-  socket.on('leave_symbol', (symbol) => {
-    for (const timeframe of Object.keys(TIMEFRAMES)) {
-      socket.leave(`candles:${symbol}:${timeframe}`);
-    }
-    console.log(`📉 ${socket.id} left all timeframes for ${symbol}`);
-  });
-
   socket.on('disconnect', () => {
     console.log(`👤 User disconnected: ${socket.id}`);
-    
+
     const userInfo = connectedUsers.get(socket.id);
     if (userInfo) {
       userSockets.delete(userInfo.email);
@@ -1351,10 +1195,19 @@ setInterval(async () => {
   }
 }, 30000);
 
+setTimeout(() => {
+  console.log('Candle counts snapshot:', {
+    '5s': candleAggregator.getCandles('ADANIENT', '5s').length,
+    '30s': candleAggregator.getCandles('ADANIENT', '30s').length,
+    '1m': candleAggregator.getCandles('ADANIENT', '1m').length
+  });
+}, 30000);
+
+
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`
-🚀 MOCK TRADING PLATFORM SERVER
+🚀 REFACTORED TRADING PLATFORM
 ========================================
 📍 Port: ${PORT}
 📊 WebSocket: Enabled
@@ -1362,8 +1215,8 @@ server.listen(PORT, () => {
 💾 Database: Connected
 🕐 Contest: 1 hour (5x speed)
 📈 Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
+🎯 Strategy: Progressive loading + Aggregation
 ========================================
 ✅ Server ready!
-⚠️ NOTE: Contest requires 430k+ rows in database
   `);
 });
