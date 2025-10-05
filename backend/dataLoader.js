@@ -1,4 +1,4 @@
-// backend/dataLoader.js
+// backend/dataLoader.js - FIXED TO USE LTP INSTEAD OF FROZEN OHLC
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 dotenv.config();
@@ -28,17 +28,19 @@ export class DataLoader {
   }
 
   async initialize() {
-    console.log('📊 DataLoader: Initializing...');
+    console.log('📊 DataLoader: Initializing with LTP-based OHLC generation...');
 
     try {
-      // FIXED: Robust symbol discovery with sampling and deduplication
+      // Enhanced symbol discovery with multiple sampling points
       const symbolSet = new Set();
       let totalRowsFetched = 0;
       
-      // Sample from multiple offsets to ensure we catch all symbols
-      for (let offsetBatch = 0; offsetBatch < 5; offsetBatch++) {
-        const offset = offsetBatch * 10000;
-        
+      console.log('🔍 Discovering symbols from database...');
+      
+      // Sample from beginning, middle, and end of data to catch all symbols
+      const sampleOffsets = [0, 50000, 100000, 150000, 200000];
+      
+      for (const offset of sampleOffsets) {
         const { data: symbolRows, error: symError } = await supabaseAdmin
           .from('LALAJI')
           .select('symbol')
@@ -46,7 +48,7 @@ export class DataLoader {
           .range(offset, offset + 9999);
 
         if (symError) {
-          console.error(`❌ Symbol query batch ${offsetBatch} error:`, symError);
+          console.error(`❌ Symbol query at offset ${offset} error:`, symError);
           continue;
         }
 
@@ -58,21 +60,21 @@ export class DataLoader {
           });
           totalRowsFetched += symbolRows.length;
           
-          // Early exit if we've found at least 15 symbols and read enough data
-          if (symbolSet.size >= 15 && totalRowsFetched > 20000) {
-            break;
-          }
+          console.log(`   Offset ${offset}: Found ${symbolSet.size} unique symbols so far`);
         }
         
-        // Stop if we got fewer rows than requested (reached end)
-        if (!symbolRows || symbolRows.length < 10000) {
+        // Early exit if we got fewer rows than requested (reached end)
+        if (symbolRows && symbolRows.length < 10000) {
+          console.log(`   Reached end of data at offset ${offset}`);
           break;
         }
       }
 
       this.symbols = Array.from(symbolSet).filter(Boolean).sort();
       
-      console.log(`✅ Found ${this.symbols.length} symbols:`, this.symbols.join(', '));
+      console.log(`✅ Symbol Discovery Complete: Found ${this.symbols.length} symbols`);
+      console.log(`   Symbols: ${this.symbols.join(', ')}`);
+      console.log(`   Total rows sampled: ${totalRowsFetched.toLocaleString()}`);
       
       if (this.symbols.length === 0) {
         throw new Error('No symbols found in database');
@@ -98,6 +100,7 @@ export class DataLoader {
       this.dataEndTime = new Date(endData[0].timestamp).getTime();
 
       console.log(`⏰ Data span: ${new Date(this.dataStartTime).toISOString()} to ${new Date(this.dataEndTime).toISOString()}`);
+      console.log(`   Duration: ${((this.dataEndTime - this.dataStartTime) / (1000 * 60 * 60)).toFixed(2)} hours`);
 
       // Load first window
       await this.loadWindow(this.dataStartTime);
@@ -154,12 +157,29 @@ export class DataLoader {
 
           const symbolData = windowData.get(row.symbol);
           if (symbolData) {
+            // CRITICAL FIX: Use last_traded_price for ALL OHLC values
+            // This ensures we get real price movement instead of frozen database OHLC
+            const ltp = parseFloat(row.last_traded_price);
+            
+            // Validate LTP
+            if (!ltp || isNaN(ltp) || ltp <= 0) {
+              console.warn(`⚠️ Invalid LTP for ${row.symbol} at ${row.timestamp}: ${row.last_traded_price}`);
+              continue;
+            }
+
             symbolData.push({
               timestamp_ms: new Date(row.timestamp).getTime(),
-              open: parseFloat(row.open_price) || parseFloat(row.last_traded_price),
-              high: parseFloat(row.high_price) || parseFloat(row.last_traded_price),
-              low: parseFloat(row.low_price) || parseFloat(row.last_traded_price),
-              close: parseFloat(row.close_price) || parseFloat(row.last_traded_price),
+              // FIXED: All OHLC fields now use LTP
+              // When generateBaseCandle() processes multiple ticks:
+              // - open = first tick's LTP
+              // - high = max(all ticks' LTP)
+              // - low = min(all ticks' LTP)
+              // - close = last tick's LTP
+              // This creates proper moving candles instead of flat ones
+              open: ltp,
+              high: ltp,
+              low: ltp,
+              close: ltp,
               volume: parseInt(row.volume_traded) || 0
             });
           }
@@ -169,12 +189,16 @@ export class DataLoader {
         batchCount++;
         offset += batch.length;
 
-        console.log(`   Batch ${batchCount}: +${batch.length} rows (Total: ${totalLoaded})`);
+        if (batchCount % 5 === 0) {
+          console.log(`   Batch ${batchCount}: +${batch.length} rows (Total: ${totalLoaded})`);
+        }
 
+        // Break if we got fewer rows than the limit (reached end of window)
         if (batch.length < SUPABASE_BATCH_LIMIT) break;
 
+        // Safety check - prevent infinite loops
         if (batchCount > 100) {
-          console.warn('⚠️ Exceeded max batches, stopping');
+          console.warn('⚠️ Exceeded max batches (100), stopping window load');
           break;
         }
       }
@@ -182,18 +206,37 @@ export class DataLoader {
       // Reset pointers for new window
       this.symbolPointers.clear();
 
-      // Store loaded data
+      // Store loaded data with validation
+      let validSymbolCount = 0;
       for (const [symbol, data] of windowData.entries()) {
+        if (data.length === 0) {
+          // Symbol had no ticks in this window - this is normal
+          this.loadedWindows.set(symbol, []);
+          this.symbolPointers.set(symbol, 0);
+          continue;
+        }
+
+        // Sort by timestamp to ensure chronological order
         const sortedData = data.sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+        
+        // Validate: Check for actual price variation
+        const uniquePrices = new Set(sortedData.map(t => t.close));
+        const priceRange = Math.max(...sortedData.map(t => t.close)) - Math.min(...sortedData.map(t => t.close));
+        
         this.loadedWindows.set(symbol, sortedData);
         this.symbolPointers.set(symbol, 0);
-        console.log(`   ${symbol}: ${data.length} ticks`);
+        
+        if (data.length > 0) {
+          validSymbolCount++;
+          console.log(`   ${symbol}: ${data.length} ticks, ${uniquePrices.size} unique prices, range: ${priceRange.toFixed(2)}`);
+        }
       }
 
       this.windowBoundaries.current = windowStartTime;
       this.windowBoundaries.next = windowEndTime;
 
       console.log(`✅ Window loaded: ${totalLoaded} rows in ${batchCount} batches`);
+      console.log(`   ${validSymbolCount} symbols with data in this window`);
 
     } catch (error) {
       console.error('❌ Window loading failed:', error);
@@ -213,7 +256,7 @@ export class DataLoader {
     const result = [];
     let i = pointerIndex;
 
-    // Skip to start time
+    // Skip to start time (pointer system preserved)
     while (i < symbolData.length && symbolData[i].timestamp_ms < startTime) {
       i++;
     }
@@ -224,7 +267,7 @@ export class DataLoader {
       i++;
     }
 
-    // Update pointer
+    // Update pointer for next call
     this.symbolPointers.set(symbol, i);
 
     return {
@@ -242,10 +285,12 @@ export class DataLoader {
     return timeUntilWindowEnd < bufferTime;
   }
 
+  // Non-blocking window loading (fire and forget)
   async loadNextWindowIfNeeded(currentContestTime) {
     if (this.shouldLoadNextWindow(currentContestTime) && !this.isLoading) {
       console.log('🔄 Loading next window in background...');
-      await this.loadWindow(this.windowBoundaries.next);
+      // Fire and forget - caller should not await this
+      return this.loadWindow(this.windowBoundaries.next);
     }
   }
 

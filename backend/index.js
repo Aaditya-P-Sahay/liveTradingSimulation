@@ -1,4 +1,4 @@
-// backend/index.js
+// backend/index.js - FULLY FIXED VERSION
 
 import express from 'express';
 import { createServer } from 'http';
@@ -68,7 +68,8 @@ const contestState = {
   dataEndTimestamp: null,
   symbols: [],
   latestPrices: new Map(),
-  timeMapper: null
+  timeMapper: null,
+  candleGenerationInterval: null
 };
 
 const dataLoader = new DataLoader();
@@ -79,11 +80,14 @@ const userSockets = new Map();
 const portfolioCache = new Map();
 let leaderboardCache = [];
 
-// FIXED: Generate 5s candle with dual timestamps
+// FIXED: Generate 5s candle with proper Unix timestamp for charts
 function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, dataWindowEndMs) {
   if (!symbol || universalTime == null || marketTime == null) return null;
 
   const { ticks } = dataLoader.getTicksInRange(symbol, dataWindowStartMs, dataWindowEndMs);
+
+  // FIXED: Convert universalTime to Unix timestamp for chart compatibility
+  const unixTime = Math.floor(contestState.contestStartTime.getTime() / 1000) + universalTime;
 
   if (!ticks || ticks.length === 0) {
     const prevCandles = candleAggregator.getCandles(symbol, '5s');
@@ -95,7 +99,7 @@ function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, 
     }
 
     const emptyCandle = {
-      time: universalTime,
+      time: unixTime,
       market_time: marketTime,
       open: prevClose,
       high: prevClose,
@@ -108,11 +112,11 @@ function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, 
     candleAggregator.storeCandle(symbol, '5s', emptyCandle);
     contestState.latestPrices.set(symbol, emptyCandle.close);
 
-    console.log(`      ⚪ ${symbol} 5s EMPTY @ ${new Date(marketTime * 1000).toISOString()} (carry-forward prevClose=${prevClose})`);
+    console.log(`      ⚪ ${symbol} 5s EMPTY @ ${new Date(marketTime * 1000).toISOString()} (carry-forward prevClose=${prevClose?.toFixed(2)})`);
     return emptyCandle;
   }
 
-  const candle = candleAggregator.generateBaseCandle(ticks, universalTime, marketTime, symbol);
+  const candle = candleAggregator.generateBaseCandle(ticks, unixTime, marketTime, symbol);
 
   if (candle) {
     candleAggregator.storeCandle(symbol, '5s', candle);
@@ -122,7 +126,7 @@ function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, 
   return candle;
 }
 
-// FIXED: Main candle generation loop with dual timestamps
+// FIXED: Main candle generation loop with all WebSocket events
 function generateCandlesFor5sInterval() {
   if (!contestState.isRunning || contestState.isPaused) return;
 
@@ -134,8 +138,7 @@ function generateCandlesFor5sInterval() {
   const realElapsedMs = Date.now() - contestState.contestStartTime.getTime();
   const intervalNumber = Math.floor(realElapsedMs / 5000);
   
-  // FIXED: Calculate universal time (contest seconds since start)
-  const universalTime = intervalNumber * 5;  // 0, 5, 10, 15, 20, 25, 30...
+  const universalTime = intervalNumber * 5;
   
   const config = TIMEFRAMES['5s'];
   const universalSeconds = realElapsedMs / 1000;
@@ -167,6 +170,25 @@ function generateCandlesFor5sInterval() {
         isNew: true
       });
 
+      // FIXED: Emit individual symbol tick event for frontend
+      io.emit('symbol_tick', {
+        symbol,
+        data: {
+          last_traded_price: candle.close,
+          volume_traded: candle.volume,
+          timestamp: new Date(candle.market_time * 1000).toISOString(),
+          open_price: candle.open,
+          high_price: candle.high,
+          low_price: candle.low,
+          close_price: candle.close,
+          company_name: symbol
+        },
+        universalTime: universalTime,
+        tickIndex: intervalNumber,
+        progress: Math.min((realElapsedMs / contestState.contestDurationMs) * 100, 100),
+        contestStartTime: contestState.contestStartTime.toISOString()
+      });
+
       const aggregated = candleAggregator.processAggregationCascade(symbol, '5s');
 
       for (const { timeframe, candle: aggCandle } of aggregated) {
@@ -187,13 +209,23 @@ function generateCandlesFor5sInterval() {
   }
 
   const progress = Math.min((realElapsedMs / contestState.contestDurationMs) * 100, 100);
-  io.emit('market_update', {
-    currentTime: Date.now(),
+  
+  // FIXED: Emit market_tick (not market_update) with complete data
+  io.emit('market_tick', {
+    universalTime: universalTime,
+    totalTime: 3600,
+    timestamp: new Date().toISOString(),
+    prices: Object.fromEntries(contestState.latestPrices),
     progress,
-    elapsedTime: realElapsedMs
+    elapsedTime: realElapsedMs,
+    contestStartTime: contestState.contestStartTime.toISOString(),
+    tickUpdates: successCount
   });
 
-  dataLoader.loadNextWindowIfNeeded(dataWindowStartMs);
+  // FIXED: Non-blocking window loading (fire and forget)
+  dataLoader.loadNextWindowIfNeeded(dataWindowStartMs).catch(err => {
+    console.error('❌ Error loading next window:', err);
+  });
 }
 
 function startCandleGeneration() {
@@ -274,10 +306,11 @@ async function startContest() {
     io.emit('contest_started', {
       message: 'Contest started!',
       contestId: contestState.contestId,
-      contestStartTime: contestState.contestStartTime,
+      contestStartTime: contestState.contestStartTime.toISOString(),
       symbols: contestState.symbols,
       duration: contestState.contestDurationMs,
-      timeframes: Object.keys(TIMEFRAMES)
+      timeframes: Object.keys(TIMEFRAMES),
+      speed: marketDurationMs / contestState.contestDurationMs
     });
 
     return {
@@ -781,9 +814,13 @@ function getContestStateForClient() {
     symbols: contestState.symbols,
     contestId: contestState.contestId,
     timeframes: Object.keys(TIMEFRAMES),
-    contestDurationMs: contestState.contestDurationMs
+    contestDurationMs: contestState.contestDurationMs,
+    currentDataIndex: Math.floor(elapsedTime / 1000),
+    totalDataRows: 3600,
+    speed: 5
   };
 }
+
 // REST API Routes
 app.get('/api/health', (req, res) => {
   const loaderStats = dataLoader.getStats();
@@ -1166,18 +1203,10 @@ setInterval(async () => {
   }
 }, 30000);
 
-setTimeout(() => {
-  console.log('Candle counts snapshot:', {
-    '5s': candleAggregator.getCandles('ADANIENT', '5s').length,
-    '30s': candleAggregator.getCandles('ADANIENT', '30s').length,
-    '1m': candleAggregator.getCandles('ADANIENT', '1m').length
-  });
-}, 30000);
-
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`
-🚀 REFACTORED TRADING PLATFORM
+🚀 REFACTORED TRADING PLATFORM - FULLY FIXED
 ========================================
 📍 Port: ${PORT}
 📊 WebSocket: Enabled
@@ -1186,6 +1215,7 @@ server.listen(PORT, () => {
 🕐 Contest: 1 hour (5x speed)
 📈 Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
 🎯 Strategy: Progressive loading + Aggregation
+✅ Fixed: Timestamps, Events, Symbol Discovery
 ========================================
 ✅ Server ready!
   `);

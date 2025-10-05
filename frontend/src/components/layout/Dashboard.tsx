@@ -21,7 +21,6 @@ import {
   Square,
   Zap,
   AlertCircle,
-  Eye,
   Settings
 } from 'lucide-react';
 
@@ -35,16 +34,14 @@ export const Dashboard: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshingLeaderboard, setRefreshingLeaderboard] = useState(false);
   const [showAllSymbols, setShowAllSymbols] = useState(false);
-  const [chartKey, setChartKey] = useState(0); // Force chart remount
 
   useEffect(() => {
     loadInitialData();
   }, []);
 
-  // Subscribe to symbols for live updates
   useEffect(() => {
     if (symbols.length > 0) {
-      subscribeToMultipleSymbols(symbols.slice(0, 10)); // Subscribe to first 10 symbols
+      subscribeToMultipleSymbols(symbols.slice(0, 10));
     }
   }, [symbols, subscribeToMultipleSymbols]);
 
@@ -54,7 +51,6 @@ export const Dashboard: React.FC = () => {
       
       console.log('📊 Loading initial dashboard data...');
       
-      // Load symbols and leaderboard in parallel
       const [symbolsData, leaderboardData] = await Promise.all([
         apiService.getSymbols().catch((err) => {
           console.error('Failed to load symbols:', err);
@@ -70,7 +66,6 @@ export const Dashboard: React.FC = () => {
         setSymbols(symbolsData);
         console.log(`✅ Loaded ${symbolsData.length} symbols:`, symbolsData.slice(0, 5).join(', '), '...');
         
-        // Set initial symbol if not already set
         if (!selectedSymbol || !symbolsData.includes(selectedSymbol)) {
           setSelectedSymbol(symbolsData[0]);
           console.log(`📈 Selected initial symbol: ${symbolsData[0]}`);
@@ -82,7 +77,6 @@ export const Dashboard: React.FC = () => {
       
     } catch (error) {
       console.error('❌ Failed to load initial data:', error);
-      // Use fallback values
       if (!selectedSymbol) {
         setSelectedSymbol('ADANIENT');
       }
@@ -104,25 +98,13 @@ export const Dashboard: React.FC = () => {
     }
   };
 
-  // FIXED: Chart type switching with proper cleanup
-  const handleChartTypeChange = (newType: 'line' | 'candlestick') => {
-    console.log(`🔄 Switching chart type from ${chartType} to ${newType}`);
-    setChartType(newType);
-    setChartKey(prev => prev + 1); // Force chart remount
-  };
-
-  // Get live price for selected symbol
   const getCurrentPrice = (symbol: string) => {
     const price = lastTickData.get(symbol)?.price || 0;
     return price;
   };
 
-  // Get price change data
   const getPriceChangeData = (symbol: string) => {
     const currentPrice = getCurrentPrice(symbol);
-    const tickData = lastTickData.get(symbol);
-    
-    // Simple mock calculation - in real app you'd track opening prices
     const mockChange = (currentPrice * 0.001) * (Math.random() - 0.5) * 4;
     const mockChangePercent = currentPrice ? (mockChange / currentPrice) * 100 : 0;
     
@@ -134,7 +116,6 @@ export const Dashboard: React.FC = () => {
     };
   };
 
-  // Safety check - if user is not logged in, show loading
   if (!user) {
     return (
       <div className="min-h-screen bg-gray-950 flex items-center justify-center">
@@ -148,11 +129,10 @@ export const Dashboard: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gray-950">
-      {/* ENHANCED Header */}
+      {/* Header */}
       <header className="bg-gray-900 border-b border-gray-800 sticky top-0 z-30 shadow-lg">
         <div className="container mx-auto px-4 py-4">
           <div className="flex justify-between items-center">
-            {/* Left side - Title and Status */}
             <div className="flex items-center gap-6">
               <div className="flex items-center gap-3">
                 <TrendingUp className="w-8 h-8 text-blue-500" />
@@ -162,7 +142,6 @@ export const Dashboard: React.FC = () => {
                 </div>
               </div>
               
-              {/* Enhanced Contest Status Badge */}
               <div className="flex items-center gap-3">
                 {marketState.isRunning ? (
                   <div className="flex items-center gap-2 px-4 py-2 bg-green-900/30 border border-green-700 rounded-lg">
@@ -189,7 +168,6 @@ export const Dashboard: React.FC = () => {
                   </div>
                 )}
                 
-                {/* Progress Info */}
                 {marketState.isRunning && (
                   <div className="hidden lg:flex items-center gap-4 text-sm">
                     <div className="flex items-center gap-2">
@@ -205,7 +183,6 @@ export const Dashboard: React.FC = () => {
                 )}
               </div>
               
-              {/* Time Info */}
               {marketState.contestStartTime && (
                 <div className="hidden xl:flex items-center gap-2 text-sm text-gray-400 bg-gray-800 px-3 py-2 rounded-lg">
                   <Clock className="w-4 h-4" />
@@ -217,7 +194,6 @@ export const Dashboard: React.FC = () => {
               )}
             </div>
             
-            {/* Right side - User info and logout */}
             <div className="flex items-center gap-4">
               <div className="text-right">
                 <div className="text-sm font-medium text-white">{user.name || 'User'}</div>
@@ -242,10 +218,8 @@ export const Dashboard: React.FC = () => {
       </header>
 
       <div className="container mx-auto px-4 py-6">
-        {/* Admin Controls */}
         {user?.role === 'admin' && <AdminControls />}
 
-        {/* Loading State */}
         {loading && (
           <div className="flex justify-center items-center h-64">
             <div className="flex flex-col items-center gap-3">
@@ -257,9 +231,8 @@ export const Dashboard: React.FC = () => {
 
         {!loading && (
           <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
-            {/* Main Content - Charts and Trading */}
             <div className="xl:col-span-3">
-              {/* Stock Selector - FIXED */}
+              {/* Stock Selector - FIXED: No key-based remounting */}
               <div className="mb-6 bg-gray-900 rounded-lg p-6 shadow-lg">
                 <div className="flex flex-col lg:flex-row gap-6 items-start lg:items-center">
                   <div className="flex-1 min-w-0">
@@ -272,8 +245,6 @@ export const Dashboard: React.FC = () => {
                         const newSymbol = e.target.value;
                         console.log(`📈 Changing symbol from ${selectedSymbol} to ${newSymbol}`);
                         setSelectedSymbol(newSymbol);
-                        // Force chart reload by changing key
-                        setChartKey(prev => prev + 1);
                       }}
                       className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent text-lg font-medium"
                     >
@@ -289,7 +260,6 @@ export const Dashboard: React.FC = () => {
                     </div>
                   </div>
                   
-                  {/* ENHANCED Live Price Display */}
                   {selectedSymbol && getCurrentPrice(selectedSymbol) > 0 && (
                     <div className="text-center lg:text-right bg-gray-800 p-4 rounded-lg">
                       <div className="text-sm text-gray-400 mb-1">Current Price</div>
@@ -310,7 +280,6 @@ export const Dashboard: React.FC = () => {
                     </div>
                   )}
                   
-                  {/* Progress Info Card */}
                   {marketState.isRunning && (
                     <div className="text-center bg-blue-900/20 border border-blue-700 p-4 rounded-lg">
                       <div className="text-sm text-blue-400 mb-2">Contest Progress</div>
@@ -318,7 +287,7 @@ export const Dashboard: React.FC = () => {
                         {marketState.progress.toFixed(1)}%
                       </div>
                       <div className="text-xs text-gray-400">
-                        Tick {marketState.currentDataTick} / {marketState.totalDataTicks}
+                        Tick {marketState.currentDataIndex} / 3600
                       </div>
                       <div className="w-full bg-gray-700 rounded-full h-2 mt-2">
                         <div 
@@ -331,13 +300,12 @@ export const Dashboard: React.FC = () => {
                 </div>
               </div>
 
-              {/* Chart Section - FIXED */}
+              {/* Chart Section - FIXED: Remove key prop, let component handle changes internally */}
               {selectedSymbol && (
                 <div className="mb-6">
-                  {/* Chart Type Buttons */}
                   <div className="flex gap-3 mb-6">
                     <button
-                      onClick={() => handleChartTypeChange('line')}
+                      onClick={() => setChartType('line')}
                       className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition-all duration-200 ${
                         chartType === 'line'
                           ? 'bg-blue-600 text-white shadow-lg transform scale-105'
@@ -348,7 +316,7 @@ export const Dashboard: React.FC = () => {
                       Line Chart
                     </button>
                     <button
-                      onClick={() => handleChartTypeChange('candlestick')}
+                      onClick={() => setChartType('candlestick')}
                       className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition-all duration-200 ${
                         chartType === 'candlestick'
                           ? 'bg-blue-600 text-white shadow-lg transform scale-105'
@@ -360,16 +328,15 @@ export const Dashboard: React.FC = () => {
                     </button>
                   </div>
                   
-                  {/* CRITICAL Fix: Unique key forces chart remount on symbol change */}
+                  {/* CRITICAL FIX: Remove key prop - let component handle symbol changes via useEffect */}
                   <LiveStockChart 
                     symbol={selectedSymbol} 
                     chartType={chartType}
-                    key={`chart-${selectedSymbol}-${chartType}-${chartKey}`}
                   />
                 </div>
               )}
 
-              {/* ENHANCED Trading/Portfolio Tabs */}
+              {/* Trading/Portfolio Tabs */}
               <div className="bg-gray-900 rounded-lg shadow-lg">
                 <div className="flex border-b border-gray-800">
                   <button
@@ -415,7 +382,7 @@ export const Dashboard: React.FC = () => {
               </div>
             </div>
 
-            {/* ENHANCED Right Sidebar */}
+            {/* Right Sidebar */}
             <div className="xl:col-span-1 space-y-6">
               {/* Market Status Card */}
               <div className="bg-gray-900 rounded-lg p-6 shadow-lg">
@@ -458,7 +425,6 @@ export const Dashboard: React.FC = () => {
                   </div>
                 </div>
                 
-                {/* Progress Bar */}
                 {marketState.isRunning && (
                   <div className="mt-4">
                     <div className="w-full bg-gray-800 rounded-full h-3">
@@ -471,7 +437,7 @@ export const Dashboard: React.FC = () => {
                 )}
               </div>
 
-              {/* ENHANCED Live Prices */}
+              {/* Live Prices */}
               <div className="bg-gray-900 rounded-lg p-6 shadow-lg">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -499,10 +465,7 @@ export const Dashboard: React.FC = () => {
                             ? 'bg-blue-900/30 border border-blue-700 shadow-md' 
                             : 'hover:bg-gray-800 border border-transparent'
                         }`}
-                        onClick={() => {
-                          setSelectedSymbol(symbol);
-                          setChartKey(prev => prev + 1);
-                        }}
+                        onClick={() => setSelectedSymbol(symbol)}
                       >
                         <div className="flex flex-col">
                           <span className="text-white font-medium">{symbol}</span>
@@ -532,7 +495,7 @@ export const Dashboard: React.FC = () => {
                 </div>
               </div>
 
-              {/* ENHANCED Leaderboard */}
+              {/* Leaderboard */}
               <div className="bg-gray-900 rounded-lg p-6 shadow-lg">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -599,7 +562,7 @@ export const Dashboard: React.FC = () => {
                 )}
               </div>
 
-              {/* Contest Info Card */}
+              {/* Contest Info */}
               {marketState.contestStartTime && (
                 <div className="bg-gradient-to-r from-blue-900/20 to-purple-900/20 border border-blue-700 rounded-lg p-6">
                   <h4 className="text-blue-400 font-semibold mb-3 flex items-center gap-2">
@@ -613,14 +576,6 @@ export const Dashboard: React.FC = () => {
                         {new Date(marketState.contestStartTime).toLocaleString()}
                       </span>
                     </div>
-                    {marketState.contestEndTime && (
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">Ended:</span>
-                        <span className="text-white">
-                          {new Date(marketState.contestEndTime).toLocaleString()}
-                        </span>
-                      </div>
-                    )}
                     <div className="pt-3 border-t border-blue-800">
                       <div className="text-xs text-blue-300 flex items-center gap-2">
                         <AlertCircle className="w-3 h-3" />
