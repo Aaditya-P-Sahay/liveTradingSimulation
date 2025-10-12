@@ -1,4 +1,4 @@
-// backend/index.js - FULLY FIXED VERSION
+// backend/index.js - FULLY FIXED VERSION WITH TRADE EXECUTION FIX
 
 import express from 'express';
 import { createServer } from 'http';
@@ -126,7 +126,7 @@ function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, 
   return candle;
 }
 
-// FIXED: Main candle generation loop with all WebSocket events
+// FIXED: Main candle generation loop with all WebSocket events + LEADERBOARD UPDATE
 function generateCandlesFor5sInterval() {
   if (!contestState.isRunning || contestState.isPaused) return;
 
@@ -221,6 +221,13 @@ function generateCandlesFor5sInterval() {
     contestStartTime: contestState.contestStartTime.toISOString(),
     tickUpdates: successCount
   });
+
+  // FIXED BUG #3: Update leaderboard every 30 seconds (6 intervals × 5s)
+  if (intervalNumber > 0 && intervalNumber % 6 === 0) {
+    updateLeaderboard().catch(err => {
+      console.error('❌ Error updating leaderboard:', err);
+    });
+  }
 
   // FIXED: Non-blocking window loading (fire and forget)
   dataLoader.loadNextWindowIfNeeded(dataWindowStartMs).catch(err => {
@@ -327,6 +334,7 @@ async function startContest() {
   }
 }
 
+// FIXED BUG #2: Auto square-off with CORRECT MATH
 async function stopContest() {
   if (!contestState.isRunning) {
     return { success: true, message: 'Contest not running' };
@@ -345,9 +353,16 @@ async function stopContest() {
       .eq('is_active', true);
 
     if (!shortError && shortPositions) {
+      console.log(`🔄 Auto-squaring off ${shortPositions.length} short positions...`);
+      
       for (const short of shortPositions) {
         const currentPrice = contestState.latestPrices.get(short.symbol) || short.avg_short_price;
+        
+        // FIXED BUG #2: Only add P&L, NOT the original short proceeds
+        // The short proceeds were already credited when the short was opened
         const pnl = (short.avg_short_price - currentPrice) * short.quantity;
+
+        console.log(`   📊 ${short.symbol}: Short@${short.avg_short_price} Current@${currentPrice} Qty=${short.quantity} P&L=${pnl.toFixed(2)}`);
 
         const { data: portfolio } = await supabaseAdmin
           .from('portfolio')
@@ -356,20 +371,30 @@ async function stopContest() {
           .single();
 
         if (portfolio) {
+          // CRITICAL FIX: Only add the P&L to cash
+          // The original (short.avg_short_price * short.quantity) was already added when short was opened
+          // Adding it again would give free money!
+          const newCashBalance = portfolio.cash_balance + pnl;
+          const newRealizedPnl = (portfolio.realized_pnl || 0) + pnl;
+
           await supabaseAdmin
             .from('portfolio')
             .update({
-              cash_balance: portfolio.cash_balance + (short.avg_short_price * short.quantity) + pnl,
-              realized_pnl: (portfolio.realized_pnl || 0) + pnl
+              cash_balance: parseFloat(newCashBalance.toFixed(2)),
+              realized_pnl: parseFloat(newRealizedPnl.toFixed(2))
             })
             .eq('user_email', short.user_email);
+
+          console.log(`   💰 User ${short.user_email}: Cash ${portfolio.cash_balance.toFixed(2)} → ${newCashBalance.toFixed(2)}`);
         }
 
+        // Mark short as inactive
         await supabaseAdmin
           .from('short_positions')
           .update({ is_active: false })
           .eq('id', short.id);
 
+        // Record the buy-to-cover trade
         await supabaseAdmin
           .from('trades')
           .insert({
@@ -377,9 +402,9 @@ async function stopContest() {
             symbol: short.symbol,
             company_name: short.company_name,
             order_type: 'buy_to_cover',
-            quantity: short.quantity,
-            price: currentPrice,
-            total_amount: currentPrice * short.quantity,
+            quantity: parseInt(short.quantity),
+            price: parseFloat(currentPrice.toFixed(2)),
+            total_amount: parseFloat((currentPrice * short.quantity).toFixed(2)),
             timestamp: new Date().toISOString()
           });
       }
@@ -512,6 +537,7 @@ async function getOrCreatePortfolio(userEmail) {
   }
 }
 
+// FIXED BUG #1: Correct wealth calculation without double-counting
 async function updatePortfolioValues(userEmail) {
   try {
     const portfolio = await getOrCreatePortfolio(userEmail);
@@ -552,17 +578,33 @@ async function updatePortfolioValues(userEmail) {
       shortUnrealizedPnl += (short.avg_short_price - currentPrice) * short.quantity;
     }
 
-    const totalWealth = portfolio.cash_balance + longMarketValue + longUnrealizedPnl + shortUnrealizedPnl;
+    // FIXED BUG #1: CRITICAL - Correct wealth calculation
+    // Market value ALREADY includes the unrealized P&L (current price × quantity)
+    // Adding longUnrealizedPnl again would DOUBLE-COUNT it!
+    //
+    // WRONG (old code): totalWealth = cash + longMarketValue + longUnrealizedPnl + shortUnrealizedPnl
+    // RIGHT (fixed):    totalWealth = cash + longMarketValue + shortUnrealizedPnl
+    //
+    // Example to prove this is correct:
+    // - Buy 100 shares @ ₹2000, spend ₹200,000
+    // - Cash remaining: ₹800,000
+    // - Price rises to ₹2100
+    // - longMarketValue = 100 × 2100 = ₹210,000 (this ALREADY includes the ₹10k gain)
+    // - longUnrealizedPnl = (2100-2000) × 100 = ₹10,000
+    // - Correct wealth = 800,000 + 210,000 = ₹1,010,000 ✅
+    // - Wrong wealth = 800,000 + 210,000 + 10,000 = ₹1,020,000 ❌ (extra ₹10k!)
+    const totalWealth = portfolio.cash_balance + longMarketValue + shortUnrealizedPnl;
+    
     const totalPnl = longUnrealizedPnl + shortUnrealizedPnl + (portfolio.realized_pnl || 0);
 
     const updatedPortfolio = {
       ...portfolio,
       holdings,
-      market_value: longMarketValue,
-      short_value: shortValue,
-      unrealized_pnl: longUnrealizedPnl + shortUnrealizedPnl,
-      total_wealth: totalWealth,
-      total_pnl: totalPnl,
+      market_value: parseFloat(longMarketValue.toFixed(2)),
+      short_value: parseFloat(shortValue.toFixed(2)),
+      unrealized_pnl: parseFloat((longUnrealizedPnl + shortUnrealizedPnl).toFixed(2)),
+      total_wealth: parseFloat(totalWealth.toFixed(2)),
+      total_pnl: parseFloat(totalPnl.toFixed(2)),
       last_updated: new Date().toISOString()
     };
 
@@ -582,13 +624,27 @@ async function updatePortfolioValues(userEmail) {
   }
 }
 
+// FIXED: Trade execution with proper type casting for JSONB compatibility
 async function executeTrade(userEmail, symbol, companyName, orderType, quantity, price) {
   try {
     if (!contestState.isRunning || contestState.isPaused) {
       throw new Error('Trading is only allowed when contest is running');
     }
 
-    const totalAmount = price * quantity;
+    // FIXED: Ensure all numeric values are properly typed to avoid JSONB casting errors
+    const cleanQuantity = parseInt(quantity);
+    const cleanPrice = parseFloat(price);
+    const totalAmount = cleanPrice * cleanQuantity;
+
+    // Validate inputs
+    if (isNaN(cleanQuantity) || cleanQuantity <= 0) {
+      throw new Error('Invalid quantity');
+    }
+
+    if (isNaN(cleanPrice) || cleanPrice <= 0) {
+      throw new Error('Invalid price');
+    }
+
     const portfolio = await getOrCreatePortfolio(userEmail);
 
     if (orderType === 'buy') {
@@ -598,19 +654,23 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
 
       const holdings = portfolio.holdings || {};
       if (holdings[symbol]) {
-        const newQuantity = holdings[symbol].quantity + quantity;
-        const newAvgPrice = ((holdings[symbol].avg_price * holdings[symbol].quantity) + totalAmount) / newQuantity;
+        const currentQty = parseInt(holdings[symbol].quantity);
+        const currentAvg = parseFloat(holdings[symbol].avg_price);
+        
+        const newQuantity = currentQty + cleanQuantity;
+        const newAvgPrice = ((currentAvg * currentQty) + totalAmount) / newQuantity;
+        
         holdings[symbol] = {
           ...holdings[symbol],
           quantity: newQuantity,
-          avg_price: newAvgPrice
+          avg_price: parseFloat(newAvgPrice.toFixed(2))
         };
       } else {
         holdings[symbol] = {
-          quantity,
-          avg_price: price,
+          quantity: cleanQuantity,
+          avg_price: cleanPrice,
           company_name: companyName,
-          current_price: price,
+          current_price: cleanPrice,
           market_value: totalAmount,
           unrealized_pnl: 0
         };
@@ -623,22 +683,25 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: portfolio.cash_balance,
-          holdings
+          cash_balance: parseFloat(portfolio.cash_balance.toFixed(2)),
+          holdings: holdings
         })
         .eq('user_email', userEmail);
 
     } else if (orderType === 'sell') {
       const holdings = portfolio.holdings || {};
 
-      if (!holdings[symbol] || holdings[symbol].quantity < quantity) {
+      if (!holdings[symbol] || parseInt(holdings[symbol].quantity) < cleanQuantity) {
         throw new Error('Insufficient holdings to sell');
       }
 
       const position = holdings[symbol];
-      const realizedPnl = (price - position.avg_price) * quantity;
+      const positionQty = parseInt(position.quantity);
+      const positionAvg = parseFloat(position.avg_price);
+      
+      const realizedPnl = (cleanPrice - positionAvg) * cleanQuantity;
 
-      holdings[symbol].quantity -= quantity;
+      holdings[symbol].quantity = positionQty - cleanQuantity;
       if (holdings[symbol].quantity === 0) {
         delete holdings[symbol];
       }
@@ -651,9 +714,9 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: portfolio.cash_balance,
-          holdings,
-          realized_pnl: portfolio.realized_pnl
+          cash_balance: parseFloat(portfolio.cash_balance.toFixed(2)),
+          holdings: holdings,
+          realized_pnl: parseFloat(portfolio.realized_pnl.toFixed(2))
         })
         .eq('user_email', userEmail);
 
@@ -664,9 +727,9 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           user_email: userEmail,
           symbol,
           company_name: companyName,
-          quantity,
-          avg_short_price: price,
-          current_price: price,
+          quantity: cleanQuantity,
+          avg_short_price: cleanPrice,
+          current_price: cleanPrice,
           unrealized_pnl: 0,
           is_active: true,
           opened_at: new Date().toISOString()
@@ -677,7 +740,9 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
 
       await supabaseAdmin
         .from('portfolio')
-        .update({ cash_balance: portfolio.cash_balance })
+        .update({ 
+          cash_balance: parseFloat(portfolio.cash_balance.toFixed(2))
+        })
         .eq('user_email', userEmail);
 
     } else if (orderType === 'buy_to_cover') {
@@ -693,17 +758,19 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         throw new Error('No short positions to cover');
       }
 
-      let remainingQuantity = quantity;
+      let remainingQuantity = cleanQuantity;
       let totalPnl = 0;
 
       for (const short of shorts) {
         if (remainingQuantity <= 0) break;
 
-        const coverQuantity = Math.min(remainingQuantity, short.quantity);
-        const pnl = (short.avg_short_price - price) * coverQuantity;
+        const shortQty = parseInt(short.quantity);
+        const shortAvg = parseFloat(short.avg_short_price);
+        const coverQuantity = Math.min(remainingQuantity, shortQty);
+        const pnl = (shortAvg - cleanPrice) * coverQuantity;
         totalPnl += pnl;
 
-        if (coverQuantity === short.quantity) {
+        if (coverQuantity === shortQty) {
           await supabaseAdmin
             .from('short_positions')
             .update({ is_active: false })
@@ -711,7 +778,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         } else {
           await supabaseAdmin
             .from('short_positions')
-            .update({ quantity: short.quantity - coverQuantity })
+            .update({ quantity: shortQty - coverQuantity })
             .eq('id', short.id);
         }
 
@@ -725,12 +792,13 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: portfolio.cash_balance,
-          realized_pnl: portfolio.realized_pnl
+          cash_balance: parseFloat(portfolio.cash_balance.toFixed(2)),
+          realized_pnl: parseFloat(portfolio.realized_pnl.toFixed(2))
         })
         .eq('user_email', userEmail);
     }
 
+    // FIXED: Insert trade with properly typed values to avoid JSONB casting errors
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
       .insert({
@@ -738,15 +806,20 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         symbol,
         company_name: companyName,
         order_type: orderType,
-        quantity,
-        price,
-        total_amount: totalAmount,
+        quantity: cleanQuantity,
+        price: cleanPrice,
+        total_amount: parseFloat(totalAmount.toFixed(2)),
         timestamp: new Date().toISOString()
       })
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('❌ Trade insert error:', error);
+      throw error;
+    }
+
+    console.log(`✅ Trade executed: ${userEmail} ${orderType} ${cleanQuantity} ${symbol} @ ₹${cleanPrice}`);
 
     const updatedPortfolio = await updatePortfolioValues(userEmail);
 
@@ -1215,7 +1288,7 @@ server.listen(PORT, () => {
 🕐 Contest: 1 hour (5x speed)
 📈 Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
 🎯 Strategy: Progressive loading + Aggregation
-✅ Fixed: Timestamps, Events, Symbol Discovery
+✅ Fixed: Bug #1 (Portfolio calc), Bug #2 (Auto square-off), Bug #3 (Leaderboard), Bug #4 (Trade JSONB)
 ========================================
 ✅ Server ready!
   `);
