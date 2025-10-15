@@ -1,4 +1,4 @@
-// backend/index.js - FULLY FIXED VERSION WITH ALL BUGS CORRECTED
+// backend/index.js - FULLY FIXED VERSION WITH TYPE SAFETY
 
 import express from 'express';
 import { createServer } from 'http';
@@ -80,13 +80,26 @@ const userSockets = new Map();
 const portfolioCache = new Map();
 let leaderboardCache = [];
 
-// FIXED: Generate 5s candle with proper Unix timestamp for charts
+// ============================================
+// UTILITY: Safe Number Conversion
+// ============================================
+function toSafeNumber(value, defaultValue = 0) {
+  const num = Number(value);
+  return isNaN(num) ? defaultValue : num;
+}
+
+function toSafeInteger(value, defaultValue = 0) {
+  const num = parseInt(value, 10);
+  return isNaN(num) ? defaultValue : num;
+}
+
+// ============================================
+// CANDLE GENERATION
+// ============================================
 function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, dataWindowEndMs) {
   if (!symbol || universalTime == null || marketTime == null) return null;
 
   const { ticks } = dataLoader.getTicksInRange(symbol, dataWindowStartMs, dataWindowEndMs);
-
-  // FIXED: Convert universalTime to Unix timestamp for chart compatibility
   const unixTime = Math.floor(contestState.contestStartTime.getTime() / 1000) + universalTime;
 
   if (!ticks || ticks.length === 0) {
@@ -126,7 +139,6 @@ function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, 
   return candle;
 }
 
-// FIXED: Main candle generation loop with all WebSocket events + LEADERBOARD UPDATE
 function generateCandlesFor5sInterval() {
   if (!contestState.isRunning || contestState.isPaused) return;
 
@@ -170,7 +182,6 @@ function generateCandlesFor5sInterval() {
         isNew: true
       });
 
-      // FIXED: Emit individual symbol tick event for frontend
       io.emit('symbol_tick', {
         symbol,
         data: {
@@ -210,7 +221,6 @@ function generateCandlesFor5sInterval() {
 
   const progress = Math.min((realElapsedMs / contestState.contestDurationMs) * 100, 100);
   
-  // FIXED: Emit market_tick (not market_update) with complete data
   io.emit('market_tick', {
     universalTime: universalTime,
     totalTime: 3600,
@@ -222,14 +232,12 @@ function generateCandlesFor5sInterval() {
     tickUpdates: successCount
   });
 
-  // FIXED BUG #3: Update leaderboard every 30 seconds (6 intervals × 5s)
   if (intervalNumber > 0 && intervalNumber % 6 === 0) {
     updateLeaderboard().catch(err => {
       console.error('❌ Error updating leaderboard:', err);
     });
   }
 
-  // FIXED: Non-blocking window loading (fire and forget)
   dataLoader.loadNextWindowIfNeeded(dataWindowStartMs).catch(err => {
     console.error('❌ Error loading next window:', err);
   });
@@ -254,6 +262,9 @@ function startCandleGeneration() {
   console.log('✅ Candle generation started (5s interval)');
 }
 
+// ============================================
+// CONTEST CONTROL
+// ============================================
 async function startContest() {
   if (contestState.isRunning && !contestState.isPaused) {
     return { success: true, message: 'Contest already running' };
@@ -334,7 +345,6 @@ async function startContest() {
   }
 }
 
-// FIXED BUG #2: Auto square-off with CORRECT MATH
 async function stopContest() {
   if (!contestState.isRunning) {
     return { success: true, message: 'Contest not running' };
@@ -356,13 +366,14 @@ async function stopContest() {
       console.log(`🔄 Auto-squaring off ${shortPositions.length} short positions...`);
       
       for (const short of shortPositions) {
-        const currentPrice = contestState.latestPrices.get(short.symbol) || short.avg_short_price;
+        // ✅ TYPE SAFETY: Convert to numbers
+        const shortQty = toSafeInteger(short.quantity);
+        const shortPrice = toSafeNumber(short.avg_short_price);
+        const currentPrice = toSafeNumber(contestState.latestPrices.get(short.symbol) || shortPrice);
         
-        // FIXED BUG #2: Only add P&L, NOT the original short proceeds
-        // The short proceeds were already credited when the short was opened
-        const pnl = (short.avg_short_price - currentPrice) * short.quantity;
+        const pnl = (shortPrice - currentPrice) * shortQty;
 
-        console.log(`   📊 ${short.symbol}: Short@${short.avg_short_price} Current@${currentPrice} Qty=${short.quantity} P&L=${pnl.toFixed(2)}`);
+        console.log(`   📊 ${short.symbol}: Short@${shortPrice} Current@${currentPrice} Qty=${shortQty} P&L=${pnl.toFixed(2)}`);
 
         const { data: portfolio } = await supabaseAdmin
           .from('portfolio')
@@ -371,11 +382,12 @@ async function stopContest() {
           .single();
 
         if (portfolio) {
-          // CRITICAL FIX: Only add the P&L to cash
-          // The original (short.avg_short_price * short.quantity) was already added when short was opened
-          // Adding it again would give free money!
-          const newCashBalance = portfolio.cash_balance + pnl;
-          const newRealizedPnl = (portfolio.realized_pnl || 0) + pnl;
+          // ✅ TYPE SAFETY: Ensure cash_balance is number
+          const currentCash = toSafeNumber(portfolio.cash_balance);
+          const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
+          
+          const newCashBalance = currentCash + pnl;
+          const newRealizedPnl = currentRealizedPnl + pnl;
 
           await supabaseAdmin
             .from('portfolio')
@@ -385,16 +397,14 @@ async function stopContest() {
             })
             .eq('user_email', short.user_email);
 
-          console.log(`   💰 User ${short.user_email}: Cash ${portfolio.cash_balance.toFixed(2)} → ${newCashBalance.toFixed(2)}`);
+          console.log(`   💰 User ${short.user_email}: Cash ${currentCash.toFixed(2)} → ${newCashBalance.toFixed(2)}`);
         }
 
-        // Mark short as inactive
         await supabaseAdmin
           .from('short_positions')
           .update({ is_active: false })
           .eq('id', short.id);
 
-        // Record the buy-to-cover trade
         await supabaseAdmin
           .from('trades')
           .insert({
@@ -402,9 +412,9 @@ async function stopContest() {
             symbol: short.symbol,
             company_name: short.company_name,
             order_type: 'buy_to_cover',
-            quantity: short.quantity,
+            quantity: shortQty,  // ✅ INTEGER
             price: currentPrice,
-            total_amount: currentPrice * short.quantity,
+            total_amount: currentPrice * shortQty,
             timestamp: new Date().toISOString()
           });
       }
@@ -435,6 +445,9 @@ function getCurrentPrice(symbol) {
   return contestState.latestPrices.get(symbol) || null;
 }
 
+// ============================================
+// AUTHENTICATION
+// ============================================
 async function authenticateToken(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -492,6 +505,9 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
+// ============================================
+// PORTFOLIO MANAGEMENT
+// ============================================
 async function getOrCreatePortfolio(userEmail) {
   if (portfolioCache.has(userEmail)) {
     return portfolioCache.get(userEmail);
@@ -537,7 +553,6 @@ async function getOrCreatePortfolio(userEmail) {
   }
 }
 
-// FIXED BUG #1: Correct wealth calculation without double-counting
 async function updatePortfolioValues(userEmail) {
   try {
     const portfolio = await getOrCreatePortfolio(userEmail);
@@ -548,17 +563,23 @@ async function updatePortfolioValues(userEmail) {
 
     const holdings = portfolio.holdings || {};
     for (const [symbol, position] of Object.entries(holdings)) {
-      const currentPrice = getCurrentPrice(symbol);
-      if (currentPrice && position.quantity > 0) {
-        const positionValue = currentPrice * position.quantity;
+      // ✅ TYPE SAFETY: Convert JSONB values to numbers
+      const qty = toSafeInteger(position.quantity);
+      const avgPrice = toSafeNumber(position.avg_price);
+      const currentPrice = toSafeNumber(getCurrentPrice(symbol) || avgPrice);
+      
+      if (qty > 0) {
+        const positionValue = currentPrice * qty;
         longMarketValue += positionValue;
-        longUnrealizedPnl += (currentPrice - position.avg_price) * position.quantity;
+        longUnrealizedPnl += (currentPrice - avgPrice) * qty;
 
         holdings[symbol] = {
           ...position,
-          current_price: currentPrice,
-          market_value: positionValue,
-          unrealized_pnl: (currentPrice - position.avg_price) * position.quantity
+          quantity: qty,               // ✅ Ensure number
+          avg_price: avgPrice,         // ✅ Ensure number
+          current_price: currentPrice, // ✅ Ensure number
+          market_value: positionValue, // ✅ Ensure number
+          unrealized_pnl: (currentPrice - avgPrice) * qty  // ✅ Ensure number
         };
       }
     }
@@ -573,38 +594,32 @@ async function updatePortfolioValues(userEmail) {
     let shortUnrealizedPnl = 0;
 
     for (const short of shortPositions || []) {
-      const currentPrice = getCurrentPrice(short.symbol) || short.avg_short_price;
-      shortValue += currentPrice * short.quantity;
-      shortUnrealizedPnl += (short.avg_short_price - currentPrice) * short.quantity;
+      // ✅ TYPE SAFETY
+      const shortQty = toSafeInteger(short.quantity);
+      const shortPrice = toSafeNumber(short.avg_short_price);
+      const currentPrice = toSafeNumber(getCurrentPrice(short.symbol) || shortPrice);
+      
+      shortValue += currentPrice * shortQty;
+      shortUnrealizedPnl += (shortPrice - currentPrice) * shortQty;
     }
 
-    // FIXED BUG #1: CRITICAL - Correct wealth calculation
-    // Market value ALREADY includes the unrealized P&L (current price × quantity)
-    // Adding longUnrealizedPnl again would DOUBLE-COUNT it!
-    //
-    // WRONG (old code): totalWealth = cash + longMarketValue + longUnrealizedPnl + shortUnrealizedPnl
-    // RIGHT (fixed):    totalWealth = cash + longMarketValue + shortUnrealizedPnl
-    //
-    // Example to prove this is correct:
-    // - Buy 100 shares @ ₹2000, spend ₹200,000
-    // - Cash remaining: ₹800,000
-    // - Price rises to ₹2100
-    // - longMarketValue = 100 × 2100 = ₹210,000 (this ALREADY includes the ₹10k gain)
-    // - longUnrealizedPnl = (2100-2000) × 100 = ₹10,000
-    // - Correct wealth = 800,000 + 210,000 = ₹1,010,000 ✅
-    // - Wrong wealth = 800,000 + 210,000 + 10,000 = ₹1,020,000 ❌ (extra ₹10k!)
-    const totalWealth = portfolio.cash_balance + longMarketValue + shortUnrealizedPnl;
+    // ✅ TYPE SAFETY: Cash balance
+    const cashBalance = toSafeNumber(portfolio.cash_balance);
+    const realizedPnl = toSafeNumber(portfolio.realized_pnl);
     
-    const totalPnl = longUnrealizedPnl + shortUnrealizedPnl + (portfolio.realized_pnl || 0);
+    const totalWealth = cashBalance + longMarketValue + shortUnrealizedPnl;
+    const totalPnl = longUnrealizedPnl + shortUnrealizedPnl + realizedPnl;
 
     const updatedPortfolio = {
       ...portfolio,
       holdings,
-      market_value: longMarketValue,
-      short_value: shortValue,
-      unrealized_pnl: longUnrealizedPnl + shortUnrealizedPnl,
-      total_wealth: totalWealth,
-      total_pnl: totalPnl,
+      cash_balance: cashBalance,           // ✅ Number
+      market_value: longMarketValue,       // ✅ Number
+      short_value: shortValue,             // ✅ Number
+      unrealized_pnl: longUnrealizedPnl + shortUnrealizedPnl,  // ✅ Number
+      total_wealth: totalWealth,           // ✅ Number
+      total_pnl: totalPnl,                 // ✅ Number
+      realized_pnl: realizedPnl,           // ✅ Number
       last_updated: new Date().toISOString()
     };
 
@@ -624,78 +639,131 @@ async function updatePortfolioValues(userEmail) {
   }
 }
 
+// ============================================
+// TRADE EXECUTION (FULLY TYPE-SAFE)
+// ============================================
 async function executeTrade(userEmail, symbol, companyName, orderType, quantity, price) {
   try {
     if (!contestState.isRunning || contestState.isPaused) {
       throw new Error('Trading is only allowed when contest is running');
     }
 
-    const totalAmount = price * quantity;
+    // ✅ CRITICAL FIX: Ensure all numeric values are actual numbers
+    const numQuantity = toSafeInteger(quantity);
+    const numPrice = toSafeNumber(price);
+
+    if (numQuantity <= 0) {
+      throw new Error('Invalid quantity');
+    }
+    if (numPrice <= 0) {
+      throw new Error('Invalid price');
+    }
+
+    const totalAmount = numQuantity * numPrice;
+
+    console.log(`🔄 Executing ${orderType}: ${numQuantity} ${symbol} @ ₹${numPrice} (Total: ₹${totalAmount})`);
+
     const portfolio = await getOrCreatePortfolio(userEmail);
 
     if (orderType === 'buy') {
-      if (portfolio.cash_balance < totalAmount) {
+      const currentCash = toSafeNumber(portfolio.cash_balance);
+      
+      if (currentCash < totalAmount) {
         throw new Error('Insufficient cash balance');
       }
 
       const holdings = portfolio.holdings || {};
+      
       if (holdings[symbol]) {
-        const newQuantity = holdings[symbol].quantity + quantity;
-        const newAvgPrice = ((holdings[symbol].avg_price * holdings[symbol].quantity) + totalAmount) / newQuantity;
+        const existingQty = toSafeInteger(holdings[symbol].quantity);
+        const existingAvg = toSafeNumber(holdings[symbol].avg_price);
+        
+        const newQuantity = existingQty + numQuantity;
+        const newAvgPrice = ((existingAvg * existingQty) + totalAmount) / newQuantity;
+        
         holdings[symbol] = {
-          ...holdings[symbol],
-          quantity: newQuantity,
-          avg_price: newAvgPrice
+          quantity: newQuantity,              // ✅ INTEGER
+          avg_price: newAvgPrice,             // ✅ NUMERIC
+          company_name: companyName,
+          current_price: numPrice,            // ✅ NUMERIC
+          market_value: numPrice * newQuantity,  // ✅ NUMERIC
+          unrealized_pnl: (numPrice - newAvgPrice) * newQuantity  // ✅ NUMERIC
         };
       } else {
         holdings[symbol] = {
-          quantity,
-          avg_price: price,
+          quantity: numQuantity,              // ✅ INTEGER
+          avg_price: numPrice,                // ✅ NUMERIC
           company_name: companyName,
-          current_price: price,
-          market_value: totalAmount,
-          unrealized_pnl: 0
+          current_price: numPrice,            // ✅ NUMERIC
+          market_value: totalAmount,          // ✅ NUMERIC
+          unrealized_pnl: 0                   // ✅ NUMERIC
         };
       }
 
-      portfolio.cash_balance -= totalAmount;
-      portfolio.holdings = holdings;
-      portfolioCache.set(userEmail, portfolio);
+      const newCashBalance = currentCash - totalAmount;
+
+      portfolioCache.set(userEmail, {
+        ...portfolio,
+        cash_balance: newCashBalance,
+        holdings
+      });
 
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: portfolio.cash_balance,
-          holdings
+          cash_balance: newCashBalance,  // ✅ NUMERIC
+          holdings                       // ✅ JSONB with numeric values
         })
         .eq('user_email', userEmail);
 
     } else if (orderType === 'sell') {
       const holdings = portfolio.holdings || {};
 
-      if (!holdings[symbol] || holdings[symbol].quantity < quantity) {
+      if (!holdings[symbol]) {
+        throw new Error('No holdings found for this symbol');
+      }
+
+      const existingQty = toSafeInteger(holdings[symbol].quantity);
+      const existingAvg = toSafeNumber(holdings[symbol].avg_price);
+
+      if (existingQty < numQuantity) {
         throw new Error('Insufficient holdings to sell');
       }
 
-      const position = holdings[symbol];
-      const realizedPnl = (price - position.avg_price) * quantity;
+      const realizedPnl = (numPrice - existingAvg) * numQuantity;
+      const newQuantity = existingQty - numQuantity;
 
-      holdings[symbol].quantity -= quantity;
-      if (holdings[symbol].quantity === 0) {
+      if (newQuantity === 0) {
         delete holdings[symbol];
+      } else {
+        holdings[symbol] = {
+          ...holdings[symbol],
+          quantity: newQuantity,                    // ✅ INTEGER
+          current_price: numPrice,                  // ✅ NUMERIC
+          market_value: numPrice * newQuantity,     // ✅ NUMERIC
+          unrealized_pnl: (numPrice - existingAvg) * newQuantity  // ✅ NUMERIC
+        };
       }
 
-      portfolio.cash_balance += totalAmount;
-      portfolio.holdings = holdings;
-      portfolio.realized_pnl = (portfolio.realized_pnl || 0) + realizedPnl;
-      portfolioCache.set(userEmail, portfolio);
+      const currentCash = toSafeNumber(portfolio.cash_balance);
+      const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
+      
+      const newCashBalance = currentCash + totalAmount;
+      const newRealizedPnl = currentRealizedPnl + realizedPnl;
+
+      portfolioCache.set(userEmail, {
+        ...portfolio,
+        cash_balance: newCashBalance,
+        holdings,
+        realized_pnl: newRealizedPnl
+      });
 
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: portfolio.cash_balance,
-          holdings,
-          realized_pnl: portfolio.realized_pnl
+          cash_balance: newCashBalance,    // ✅ NUMERIC
+          holdings,                        // ✅ JSONB with numeric values
+          realized_pnl: newRealizedPnl     // ✅ NUMERIC
         })
         .eq('user_email', userEmail);
 
@@ -706,20 +774,27 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           user_email: userEmail,
           symbol,
           company_name: companyName,
-          quantity,
-          avg_short_price: price,
-          current_price: price,
-          unrealized_pnl: 0,
+          quantity: numQuantity,           // ✅ INTEGER
+          avg_short_price: numPrice,       // ✅ NUMERIC
+          current_price: numPrice,         // ✅ NUMERIC
+          unrealized_pnl: 0,               // ✅ NUMERIC
           is_active: true,
           opened_at: new Date().toISOString()
         });
 
-      portfolio.cash_balance += totalAmount;
-      portfolioCache.set(userEmail, portfolio);
+      const currentCash = toSafeNumber(portfolio.cash_balance);
+      const newCashBalance = currentCash + totalAmount;
+
+      portfolioCache.set(userEmail, {
+        ...portfolio,
+        cash_balance: newCashBalance
+      });
 
       await supabaseAdmin
         .from('portfolio')
-        .update({ cash_balance: portfolio.cash_balance })
+        .update({ 
+          cash_balance: newCashBalance     // ✅ NUMERIC
+        })
         .eq('user_email', userEmail);
 
     } else if (orderType === 'buy_to_cover') {
@@ -735,17 +810,19 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         throw new Error('No short positions to cover');
       }
 
-      let remainingQuantity = quantity;
+      let remainingQuantity = numQuantity;
       let totalPnl = 0;
 
       for (const short of shorts) {
         if (remainingQuantity <= 0) break;
 
-        const coverQuantity = Math.min(remainingQuantity, short.quantity);
-        const pnl = (short.avg_short_price - price) * coverQuantity;
+        const shortQty = toSafeInteger(short.quantity);
+        const shortPrice = toSafeNumber(short.avg_short_price);
+        const coverQuantity = Math.min(remainingQuantity, shortQty);
+        const pnl = (shortPrice - numPrice) * coverQuantity;
         totalPnl += pnl;
 
-        if (coverQuantity === short.quantity) {
+        if (coverQuantity === shortQty) {
           await supabaseAdmin
             .from('short_positions')
             .update({ is_active: false })
@@ -753,26 +830,37 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         } else {
           await supabaseAdmin
             .from('short_positions')
-            .update({ quantity: short.quantity - coverQuantity })
+            .update({ 
+              quantity: shortQty - coverQuantity  // ✅ INTEGER
+            })
             .eq('id', short.id);
         }
 
         remainingQuantity -= coverQuantity;
       }
 
-      portfolio.cash_balance -= totalAmount;
-      portfolio.realized_pnl = (portfolio.realized_pnl || 0) + totalPnl;
-      portfolioCache.set(userEmail, portfolio);
+      const currentCash = toSafeNumber(portfolio.cash_balance);
+      const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
+      
+      const newCashBalance = currentCash - totalAmount;
+      const newRealizedPnl = currentRealizedPnl + totalPnl;
+
+      portfolioCache.set(userEmail, {
+        ...portfolio,
+        cash_balance: newCashBalance,
+        realized_pnl: newRealizedPnl
+      });
 
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: portfolio.cash_balance,
-          realized_pnl: portfolio.realized_pnl
+          cash_balance: newCashBalance,    // ✅ NUMERIC
+          realized_pnl: newRealizedPnl     // ✅ NUMERIC
         })
         .eq('user_email', userEmail);
     }
 
+    // Record trade with type-safe values
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
       .insert({
@@ -780,15 +868,20 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         symbol,
         company_name: companyName,
         order_type: orderType,
-        quantity,
-        price,
-        total_amount: totalAmount,
+        quantity: numQuantity,             // ✅ INTEGER (required by schema)
+        price: numPrice,                   // ✅ NUMERIC
+        total_amount: totalAmount,         // ✅ NUMERIC
         timestamp: new Date().toISOString()
       })
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('❌ Trade insertion error:', error);
+      throw error;
+    }
+
+    console.log(`✅ Trade executed successfully: ${orderType} ${numQuantity} ${symbol} @ ₹${numPrice}`);
 
     const updatedPortfolio = await updatePortfolioValues(userEmail);
 
@@ -799,6 +892,9 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
   }
 }
 
+// ============================================
+// LEADERBOARD
+// ============================================
 async function updateLeaderboard() {
   try {
     const { data, error } = await supabaseAdmin
@@ -818,14 +914,14 @@ async function updateLeaderboard() {
       rank: index + 1,
       user_name: userMap.get(p.user_email)?.["Candidate's Name"] || p.user_email,
       user_email: p.user_email,
-      total_wealth: p.total_wealth,
-      total_pnl: p.total_pnl,
-      return_percentage: ((p.total_wealth - 1000000) / 1000000) * 100,
-      cash_balance: p.cash_balance,
-      market_value: p.market_value,
-      short_value: p.short_value,
-      realized_pnl: p.realized_pnl || 0,
-      unrealized_pnl: p.unrealized_pnl || 0
+      total_wealth: toSafeNumber(p.total_wealth),
+      total_pnl: toSafeNumber(p.total_pnl),
+      return_percentage: ((toSafeNumber(p.total_wealth) - 1000000) / 1000000) * 100,
+      cash_balance: toSafeNumber(p.cash_balance),
+      market_value: toSafeNumber(p.market_value),
+      short_value: toSafeNumber(p.short_value),
+      realized_pnl: toSafeNumber(p.realized_pnl),
+      unrealized_pnl: toSafeNumber(p.unrealized_pnl)
     }));
 
     leaderboardCache = leaderboard;
@@ -863,7 +959,9 @@ function getContestStateForClient() {
   };
 }
 
-// REST API Routes
+// ============================================
+// REST API ROUTES
+// ============================================
 app.get('/api/health', (req, res) => {
   const loaderStats = dataLoader.getStats();
   const aggregatorStats = candleAggregator.getStats();
@@ -952,7 +1050,15 @@ app.get('/api/auth/me', authenticateToken, (req, res) => {
 });
 
 app.get('/api/symbols', (req, res) => {
-  res.json(contestState.symbols);
+  // ✅ FIX: Always return symbols even if contest not running
+  if (contestState.symbols.length === 0) {
+    // Return default symbols if contest hasn't started
+    res.json(['ADANIENT', 'AXISBANK', 'BANKBARODA', 'CANBK', 'HDFCBANK', 'HINDALCO', 
+              'ICICIBANK', 'INFY', 'ITC', 'KOTAKBANK', 'LT', 'M&M', 'ONGC', 
+              'PNB', 'RELIANCE', 'SBIN', 'TATAMOTORS', 'TATAPOWER', 'TATASTEEL', 'TCS']);
+  } else {
+    res.json(contestState.symbols);
+  }
 });
 
 app.get('/api/timeframes', (req, res) => {
@@ -1023,6 +1129,7 @@ app.post('/api/trade', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Trade API error:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -1152,7 +1259,9 @@ app.get('/api/admin/contest/status', authenticateToken, requireAdmin, (req, res)
   });
 });
 
-// WebSocket handlers
+// ============================================
+// WEBSOCKET HANDLERS
+// ============================================
 io.on('connection', (socket) => {
   console.log(`👤 User connected: ${socket.id}`);
 
@@ -1248,7 +1357,7 @@ setInterval(async () => {
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`
-🚀 REFACTORED TRADING PLATFORM - FULLY FIXED
+🚀 TRADING PLATFORM - TYPE-SAFE VERSION
 ========================================
 📍 Port: ${PORT}
 📊 WebSocket: Enabled
@@ -1256,8 +1365,8 @@ server.listen(PORT, () => {
 💾 Database: Connected
 🕐 Contest: 1 hour (5x speed)
 📈 Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
-🎯 Strategy: Progressive loading + Aggregation
-✅ Fixed: Bug #1 (Portfolio calc), Bug #2 (Auto square-off), Bug #3 (Leaderboard)
+🎯 Type Safety: FULL (JSONB safe)
+✅ Ready for 200+ users
 ========================================
 ✅ Server ready!
   `);
