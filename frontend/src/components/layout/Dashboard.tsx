@@ -1,3 +1,4 @@
+// frontend/src/components/layout/Dashboard.tsx - COMPLETE FIXED VERSION
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useMarket } from '../../contexts/MarketContext';
@@ -232,7 +233,7 @@ export const Dashboard: React.FC = () => {
         {!loading && (
           <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
             <div className="xl:col-span-3">
-              {/* Stock Selector - FIXED: No key-based remounting */}
+              {/* Stock Selector - NO KEY PROP */}
               <div className="mb-6 bg-gray-900 rounded-lg p-6 shadow-lg">
                 <div className="flex flex-col lg:flex-row gap-6 items-start lg:items-center">
                   <div className="flex-1 min-w-0">
@@ -243,7 +244,7 @@ export const Dashboard: React.FC = () => {
                       value={selectedSymbol || ''}
                       onChange={(e) => {
                         const newSymbol = e.target.value;
-                        console.log(`📈 Changing symbol from ${selectedSymbol} to ${newSymbol}`);
+                        console.log(`📈 User selected: ${newSymbol}`);
                         setSelectedSymbol(newSymbol);
                       }}
                       className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent text-lg font-medium"
@@ -300,7 +301,7 @@ export const Dashboard: React.FC = () => {
                 </div>
               </div>
 
-              {/* Chart Section - FIXED: Remove key prop, let component handle changes internally */}
+              {/* Chart Section - NO KEY PROP */}
               {selectedSymbol && (
                 <div className="mb-6">
                   <div className="flex gap-3 mb-6">
@@ -328,7 +329,7 @@ export const Dashboard: React.FC = () => {
                     </button>
                   </div>
                   
-                  {/* CRITICAL FIX: Remove key prop - let component handle symbol changes via useEffect */}
+                  {/* CRITICAL: NO KEY PROP - Let component handle updates internally */}
                   <LiveStockChart 
                     symbol={selectedSymbol} 
                     chartType={chartType}

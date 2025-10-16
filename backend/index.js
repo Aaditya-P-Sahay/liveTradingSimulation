@@ -1,4 +1,4 @@
-// backend/index.js - FULLY FIXED VERSION WITH TYPE SAFETY
+// backend/index.js - FULLY FIXED VERSION WITH ENHANCED TYPE SAFETY AND AUTO SQUARE-OFF FIX
 
 import express from 'express';
 import { createServer } from 'http';
@@ -81,20 +81,54 @@ const portfolioCache = new Map();
 let leaderboardCache = [];
 
 // ============================================
-// UTILITY: Safe Number Conversion
+// UTILITY: Safe Number Conversion - ENHANCED
 // ============================================
 function toSafeNumber(value, defaultValue = 0) {
+  // Handle null/undefined
+  if (value === null || value === undefined) {
+    return defaultValue;
+  }
+  
+  // Handle objects (JSONB issue)
+  if (typeof value === 'object') {
+    console.warn('⚠️ Received object where number expected:', value);
+    return defaultValue;
+  }
+  
   const num = Number(value);
-  return isNaN(num) ? defaultValue : num;
+  
+  if (isNaN(num) || !isFinite(num)) {
+    console.warn('⚠️ Invalid number conversion:', { value, result: num });
+    return defaultValue;
+  }
+  
+  return num;
 }
 
 function toSafeInteger(value, defaultValue = 0) {
+  // Handle null/undefined
+  if (value === null || value === undefined) {
+    return defaultValue;
+  }
+  
+  // Handle objects (JSONB issue)
+  if (typeof value === 'object') {
+    console.error('❌ CRITICAL: Received object where integer expected:', value);
+    return defaultValue;
+  }
+  
   const num = parseInt(value, 10);
-  return isNaN(num) ? defaultValue : num;
+  
+  if (isNaN(num) || !isFinite(num)) {
+    console.warn('⚠️ Invalid integer conversion:', { value, result: num });
+    return defaultValue;
+  }
+  
+  return num;
 }
 
 // ============================================
-// CANDLE GENERATION
+// CANDLE GENERATION (unchanged)
 // ============================================
 function generate5sCandle(symbol, universalTime, marketTime, dataWindowStartMs, dataWindowEndMs) {
   if (!symbol || universalTime == null || marketTime == null) return null;
@@ -371,9 +405,13 @@ async function stopContest() {
         const shortPrice = toSafeNumber(short.avg_short_price);
         const currentPrice = toSafeNumber(contestState.latestPrices.get(short.symbol) || shortPrice);
         
+        // ✅ CRITICAL FIX: Calculate P&L correctly
         const pnl = (shortPrice - currentPrice) * shortQty;
+        
+        // ✅ CRITICAL FIX: To close short position, we must BUY shares at current price
+        const coverCost = currentPrice * shortQty;
 
-        console.log(`   📊 ${short.symbol}: Short@${shortPrice} Current@${currentPrice} Qty=${shortQty} P&L=${pnl.toFixed(2)}`);
+        console.log(`   📊 ${short.symbol}: Short@${shortPrice.toFixed(2)} Current@${currentPrice.toFixed(2)} Qty=${shortQty} P&L=${pnl.toFixed(2)} CoverCost=${coverCost.toFixed(2)}`);
 
         const { data: portfolio } = await supabaseAdmin
           .from('portfolio')
@@ -386,7 +424,10 @@ async function stopContest() {
           const currentCash = toSafeNumber(portfolio.cash_balance);
           const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
           
-          const newCashBalance = currentCash + pnl;
+          // ✅ FIXED: Deduct cover cost (we're buying shares)
+          // Previously: newCashBalance = currentCash + pnl (WRONG - double counts)
+          // Correct: newCashBalance = currentCash - coverCost
+          const newCashBalance = currentCash - coverCost;
           const newRealizedPnl = currentRealizedPnl + pnl;
 
           await supabaseAdmin
@@ -397,7 +438,7 @@ async function stopContest() {
             })
             .eq('user_email', short.user_email);
 
-          console.log(`   💰 User ${short.user_email}: Cash ${currentCash.toFixed(2)} → ${newCashBalance.toFixed(2)}`);
+          console.log(`   💰 User ${short.user_email}: Cash ${currentCash.toFixed(2)} - CoverCost ${coverCost.toFixed(2)} = ${newCashBalance.toFixed(2)} | P&L: ${pnl.toFixed(2)}`);
         }
 
         await supabaseAdmin
@@ -414,7 +455,7 @@ async function stopContest() {
             order_type: 'buy_to_cover',
             quantity: shortQty,  // ✅ INTEGER
             price: currentPrice,
-            total_amount: currentPrice * shortQty,
+            total_amount: coverCost,
             timestamp: new Date().toISOString()
           });
       }
@@ -446,7 +487,7 @@ function getCurrentPrice(symbol) {
 }
 
 // ============================================
-// AUTHENTICATION
+// AUTHENTICATION (unchanged)
 // ============================================
 async function authenticateToken(req, res, next) {
   try {
@@ -506,7 +547,7 @@ async function requireAdmin(req, res, next) {
 }
 
 // ============================================
-// PORTFOLIO MANAGEMENT
+// PORTFOLIO MANAGEMENT (unchanged calculation, just type safety)
 // ============================================
 async function getOrCreatePortfolio(userEmail) {
   if (portfolioCache.has(userEmail)) {
@@ -607,6 +648,7 @@ async function updatePortfolioValues(userEmail) {
     const cashBalance = toSafeNumber(portfolio.cash_balance);
     const realizedPnl = toSafeNumber(portfolio.realized_pnl);
     
+    // ✅ CORRECT FORMULA: cash already includes short proceeds
     const totalWealth = cashBalance + longMarketValue + shortUnrealizedPnl;
     const totalPnl = longUnrealizedPnl + shortUnrealizedPnl + realizedPnl;
 
@@ -640,7 +682,7 @@ async function updatePortfolioValues(userEmail) {
 }
 
 // ============================================
-// TRADE EXECUTION (FULLY TYPE-SAFE)
+// TRADE EXECUTION - FULLY FIXED WITH ENHANCED TYPE SAFETY
 // ============================================
 async function executeTrade(userEmail, symbol, companyName, orderType, quantity, price) {
   try {
@@ -648,15 +690,27 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       throw new Error('Trading is only allowed when contest is running');
     }
 
+    // ✅ ENHANCED TYPE SAFETY: Log incoming values
+    console.log('📥 Trade request received:', {
+      userEmail,
+      symbol,
+      orderType,
+      quantity,
+      quantityType: typeof quantity,
+      price,
+      priceType: typeof price
+    });
+
     // ✅ CRITICAL FIX: Ensure all numeric values are actual numbers
     const numQuantity = toSafeInteger(quantity);
     const numPrice = toSafeNumber(price);
 
+    // ✅ VALIDATION: Ensure conversion succeeded
     if (numQuantity <= 0) {
-      throw new Error('Invalid quantity');
+      throw new Error(`Invalid quantity: ${quantity} (converted to ${numQuantity})`);
     }
     if (numPrice <= 0) {
-      throw new Error('Invalid price');
+      throw new Error(`Invalid price: ${price} (converted to ${numPrice})`);
     }
 
     const totalAmount = numQuantity * numPrice;
@@ -842,6 +896,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       const currentCash = toSafeNumber(portfolio.cash_balance);
       const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
       
+      // ✅ Deduct cover cost (we're buying shares)
       const newCashBalance = currentCash - totalAmount;
       const newRealizedPnl = currentRealizedPnl + totalPnl;
 
@@ -860,19 +915,29 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         .eq('user_email', userEmail);
     }
 
+    // ✅ CRITICAL: Final type safety check before database insert
+    const safeTradeData = {
+      user_email: userEmail,
+      symbol,
+      company_name: companyName,
+      order_type: orderType,
+      quantity: Math.floor(numQuantity),           // ✅ Force INTEGER
+      price: parseFloat(numPrice.toFixed(2)),      // ✅ Force NUMERIC with 2 decimals
+      total_amount: parseFloat(totalAmount.toFixed(2)), // ✅ Force NUMERIC
+      timestamp: new Date().toISOString()
+    };
+
+    console.log('📝 Inserting trade with sanitized data:', {
+      quantity: safeTradeData.quantity,
+      quantityType: typeof safeTradeData.quantity,
+      price: safeTradeData.price,
+      priceType: typeof safeTradeData.price
+    });
+
     // Record trade with type-safe values
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
-      .insert({
-        user_email: userEmail,
-        symbol,
-        company_name: companyName,
-        order_type: orderType,
-        quantity: numQuantity,             // ✅ INTEGER (required by schema)
-        price: numPrice,                   // ✅ NUMERIC
-        total_amount: totalAmount,         // ✅ NUMERIC
-        timestamp: new Date().toISOString()
-      })
+      .insert(safeTradeData)
       .select()
       .single();
 
@@ -893,7 +958,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
 }
 
 // ============================================
-// LEADERBOARD
+// LEADERBOARD (unchanged)
 // ============================================
 async function updateLeaderboard() {
   try {
@@ -960,7 +1025,7 @@ function getContestStateForClient() {
 }
 
 // ============================================
-// REST API ROUTES
+// REST API ROUTES (unchanged)
 // ============================================
 app.get('/api/health', (req, res) => {
   const loaderStats = dataLoader.getStats();
@@ -1050,9 +1115,7 @@ app.get('/api/auth/me', authenticateToken, (req, res) => {
 });
 
 app.get('/api/symbols', (req, res) => {
-  // ✅ FIX: Always return symbols even if contest not running
   if (contestState.symbols.length === 0) {
-    // Return default symbols if contest hasn't started
     res.json(['ADANIENT', 'AXISBANK', 'BANKBARODA', 'CANBK', 'HDFCBANK', 'HINDALCO', 
               'ICICIBANK', 'INFY', 'ITC', 'KOTAKBANK', 'LT', 'M&M', 'ONGC', 
               'PNB', 'RELIANCE', 'SBIN', 'TATAMOTORS', 'TATAPOWER', 'TATASTEEL', 'TCS']);
@@ -1260,7 +1323,7 @@ app.get('/api/admin/contest/status', authenticateToken, requireAdmin, (req, res)
 });
 
 // ============================================
-// WEBSOCKET HANDLERS
+// WEBSOCKET HANDLERS (unchanged)
 // ============================================
 io.on('connection', (socket) => {
   console.log(`👤 User connected: ${socket.id}`);
@@ -1357,7 +1420,7 @@ setInterval(async () => {
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`
-🚀 TRADING PLATFORM - TYPE-SAFE VERSION
+🚀 TRADING PLATFORM - FIXED VERSION
 ========================================
 📍 Port: ${PORT}
 📊 WebSocket: Enabled
@@ -1365,7 +1428,8 @@ server.listen(PORT, () => {
 💾 Database: Connected
 🕐 Contest: 1 hour (5x speed)
 📈 Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
-🎯 Type Safety: FULL (JSONB safe)
+🎯 Type Safety: FULL (Enhanced)
+🔧 Auto Square-Off: FIXED
 ✅ Ready for 200+ users
 ========================================
 ✅ Server ready!
