@@ -1,4 +1,4 @@
-// backend/index.js - FULLY FIXED VERSION WITH ENHANCED TYPE SAFETY AND AUTO SQUARE-OFF FIX
+// backend/index.js - COMPLETE FIXED VERSION WITH CONTEST RESET
 
 import express from 'express';
 import { createServer } from 'http';
@@ -81,15 +81,13 @@ const portfolioCache = new Map();
 let leaderboardCache = [];
 
 // ============================================
-// UTILITY: Safe Number Conversion - ENHANCED
+// UTILITY: Safe Number Conversion
 // ============================================
 function toSafeNumber(value, defaultValue = 0) {
-  // Handle null/undefined
   if (value === null || value === undefined) {
     return defaultValue;
   }
   
-  // Handle objects (JSONB issue)
   if (typeof value === 'object') {
     console.warn('⚠️ Received object where number expected:', value);
     return defaultValue;
@@ -106,12 +104,10 @@ function toSafeNumber(value, defaultValue = 0) {
 }
 
 function toSafeInteger(value, defaultValue = 0) {
-  // Handle null/undefined
   if (value === null || value === undefined) {
     return defaultValue;
   }
   
-  // Handle objects (JSONB issue)
   if (typeof value === 'object') {
     console.error('❌ CRITICAL: Received object where integer expected:', value);
     return defaultValue;
@@ -125,6 +121,115 @@ function toSafeInteger(value, defaultValue = 0) {
   }
   
   return num;
+}
+
+// ============================================
+// ✅ NEW: CONTEST DATA CLEANUP FUNCTION
+// ============================================
+async function clearContestData() {
+  console.log('🧹 ============================================');
+  console.log('🧹 STARTING CONTEST DATA CLEANUP');
+  console.log('🧹 ============================================');
+  
+  const cleanupResults = {
+    trades: 0,
+    shortPositions: 0,
+    portfoliosReset: 0,
+    errors: []
+  };
+
+  try {
+    // Step 1: Delete all trades
+    console.log('📋 Step 1/3: Clearing trades...');
+    const { data: deletedTrades, error: tradesError, count: tradesCount } = await supabaseAdmin
+      .from('trades')
+      .delete({ count: 'exact' })
+      .neq('id', '00000000-0000-0000-0000-000000000000');
+    
+    if (tradesError) {
+      console.error('❌ Failed to clear trades:', tradesError);
+      cleanupResults.errors.push({ step: 'trades', error: tradesError.message });
+    } else {
+      cleanupResults.trades = tradesCount || 0;
+      console.log(`   ✅ Cleared ${cleanupResults.trades} trades`);
+    }
+
+    // Step 2: Delete all short positions (including inactive ones from auto square-off)
+    console.log('📋 Step 2/3: Clearing short positions...');
+    const { data: deletedShorts, error: shortsError, count: shortsCount } = await supabaseAdmin
+      .from('short_positions')
+      .delete({ count: 'exact' })
+      .neq('id', '00000000-0000-0000-0000-000000000000');
+    
+    if (shortsError) {
+      console.error('❌ Failed to clear short positions:', shortsError);
+      cleanupResults.errors.push({ step: 'shorts', error: shortsError.message });
+    } else {
+      cleanupResults.shortPositions = shortsCount || 0;
+      console.log(`   ✅ Cleared ${cleanupResults.shortPositions} short positions`);
+    }
+
+    // Step 3: Reset all portfolios to initial state (1M cash)
+    console.log('📋 Step 3/3: Resetting portfolios to 1M cash...');
+    const { data: resetPortfolios, error: portfolioError, count: portfolioCount } = await supabaseAdmin
+      .from('portfolio')
+      .update({
+        cash_balance: 1000000,
+        holdings: {},
+        market_value: 0,
+        total_wealth: 1000000,
+        short_value: 0,
+        unrealized_pnl: 0,
+        total_pnl: 0,
+        realized_pnl: 0,
+        last_updated: new Date().toISOString()
+      }, { count: 'exact' })
+      .neq('user_email', '');
+    
+    if (portfolioError) {
+      console.error('❌ Failed to reset portfolios:', portfolioError);
+      cleanupResults.errors.push({ step: 'portfolios', error: portfolioError.message });
+    } else {
+      cleanupResults.portfoliosReset = portfolioCount || 0;
+      console.log(`   ✅ Reset ${cleanupResults.portfoliosReset} portfolios to 1M cash`);
+    }
+
+    // Step 4: Clear in-memory caches
+    console.log('📋 Step 4/4: Clearing memory caches...');
+    portfolioCache.clear();
+    leaderboardCache = [];
+    console.log('   ✅ Memory caches cleared');
+
+    // Summary
+    console.log('🧹 ============================================');
+    console.log('🧹 CLEANUP SUMMARY:');
+    console.log(`   📝 Trades deleted: ${cleanupResults.trades}`);
+    console.log(`   📉 Short positions deleted: ${cleanupResults.shortPositions}`);
+    console.log(`   💰 Portfolios reset: ${cleanupResults.portfoliosReset}`);
+    if (cleanupResults.errors.length > 0) {
+      console.log(`   ⚠️ Errors encountered: ${cleanupResults.errors.length}`);
+      cleanupResults.errors.forEach(err => {
+        console.log(`      - ${err.step}: ${err.error}`);
+      });
+    } else {
+      console.log('   ✅ No errors');
+    }
+    console.log('🧹 ============================================');
+
+    return {
+      success: cleanupResults.errors.length === 0,
+      results: cleanupResults
+    };
+
+  } catch (error) {
+    console.error('❌ CRITICAL ERROR during cleanup:', error);
+    cleanupResults.errors.push({ step: 'general', error: error.message });
+    return {
+      success: false,
+      results: cleanupResults,
+      error: error.message
+    };
+  }
 }
 
 // ============================================
@@ -297,7 +402,7 @@ function startCandleGeneration() {
 }
 
 // ============================================
-// CONTEST CONTROL
+// ✅ MODIFIED: CONTEST CONTROL WITH CLEANUP
 // ============================================
 async function startContest() {
   if (contestState.isRunning && !contestState.isPaused) {
@@ -312,7 +417,41 @@ async function startContest() {
   }
 
   try {
-    console.log('🚀 STARTING NEW CONTEST...');
+    console.log('🚀 ============================================');
+    console.log('🚀 STARTING NEW CONTEST');
+    console.log('🚀 ============================================');
+
+    // ✅ NEW: Ensure all portfolios have fresh 1M for new contest instance
+    console.log('💰 Ensuring all users have 1M cash for new contest...');
+    
+    const { data: existingPortfolios, error: checkError } = await supabaseAdmin
+      .from('portfolio')
+      .select('user_email, cash_balance, total_wealth');
+    
+    if (!checkError && existingPortfolios) {
+      for (const portfolio of existingPortfolios) {
+        // Reset any portfolio that doesn't have exactly 1M (from previous contest)
+        if (portfolio.total_wealth !== 1000000) {
+          await supabaseAdmin
+            .from('portfolio')
+            .update({
+              cash_balance: 1000000,
+              holdings: {},
+              market_value: 0,
+              total_wealth: 1000000,
+              short_value: 0,
+              unrealized_pnl: 0,
+              total_pnl: 0,
+              realized_pnl: 0,
+              last_updated: new Date().toISOString()
+            })
+            .eq('user_email', portfolio.user_email);
+          
+          console.log(`   ✅ Reset portfolio for ${portfolio.user_email} (had ₹${portfolio.total_wealth})`);
+        }
+      }
+      console.log(`💰 Verified/reset ${existingPortfolios.length} existing portfolios`);
+    }
 
     const { symbols, dataStartTime, dataEndTime } = await dataLoader.initialize();
 
@@ -385,33 +524,34 @@ async function stopContest() {
   }
 
   try {
-    console.log('🛑 Stopping contest...');
+    console.log('🛑 ============================================');
+    console.log('🛑 STOPPING CONTEST');
+    console.log('🛑 ============================================');
 
+    // Step 1: Stop candle generation
     if (contestState.candleGenerationInterval) {
       clearInterval(contestState.candleGenerationInterval);
+      console.log('✅ Candle generation stopped');
     }
 
+    // Step 2: Auto square-off all active short positions
     const { data: shortPositions, error: shortError } = await supabaseAdmin
       .from('short_positions')
       .select('*')
       .eq('is_active', true);
 
-    if (!shortError && shortPositions) {
+    if (!shortError && shortPositions && shortPositions.length > 0) {
       console.log(`🔄 Auto-squaring off ${shortPositions.length} short positions...`);
       
       for (const short of shortPositions) {
-        // ✅ TYPE SAFETY: Convert to numbers
         const shortQty = toSafeInteger(short.quantity);
         const shortPrice = toSafeNumber(short.avg_short_price);
         const currentPrice = toSafeNumber(contestState.latestPrices.get(short.symbol) || shortPrice);
         
-        // ✅ CRITICAL FIX: Calculate P&L correctly
         const pnl = (shortPrice - currentPrice) * shortQty;
-        
-        // ✅ CRITICAL FIX: To close short position, we must BUY shares at current price
         const coverCost = currentPrice * shortQty;
 
-        console.log(`   📊 ${short.symbol}: Short@${shortPrice.toFixed(2)} Current@${currentPrice.toFixed(2)} Qty=${shortQty} P&L=${pnl.toFixed(2)} CoverCost=${coverCost.toFixed(2)}`);
+        console.log(`   📊 ${short.symbol}: Short@₹${shortPrice.toFixed(2)} Cover@₹${currentPrice.toFixed(2)} Qty=${shortQty} P&L=₹${pnl.toFixed(2)}`);
 
         const { data: portfolio } = await supabaseAdmin
           .from('portfolio')
@@ -420,13 +560,9 @@ async function stopContest() {
           .single();
 
         if (portfolio) {
-          // ✅ TYPE SAFETY: Ensure cash_balance is number
           const currentCash = toSafeNumber(portfolio.cash_balance);
           const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
           
-          // ✅ FIXED: Deduct cover cost (we're buying shares)
-          // Previously: newCashBalance = currentCash + pnl (WRONG - double counts)
-          // Correct: newCashBalance = currentCash - coverCost
           const newCashBalance = currentCash - coverCost;
           const newRealizedPnl = currentRealizedPnl + pnl;
 
@@ -438,7 +574,7 @@ async function stopContest() {
             })
             .eq('user_email', short.user_email);
 
-          console.log(`   💰 User ${short.user_email}: Cash ${currentCash.toFixed(2)} - CoverCost ${coverCost.toFixed(2)} = ${newCashBalance.toFixed(2)} | P&L: ${pnl.toFixed(2)}`);
+          console.log(`   💰 ${short.user_email}: Cash ₹${currentCash.toFixed(2)} → ₹${newCashBalance.toFixed(2)} (P&L: ₹${pnl.toFixed(2)})`);
         }
 
         await supabaseAdmin
@@ -453,7 +589,7 @@ async function stopContest() {
             symbol: short.symbol,
             company_name: short.company_name,
             order_type: 'buy_to_cover',
-            quantity: shortQty,  // ✅ INTEGER
+            quantity: shortQty,
             price: currentPrice,
             total_amount: coverCost,
             timestamp: new Date().toISOString()
@@ -461,20 +597,46 @@ async function stopContest() {
       }
 
       console.log(`✅ Auto squared-off ${shortPositions.length} short positions`);
+    } else {
+      console.log('ℹ️ No active short positions to square-off');
     }
 
+    // Step 3: Update final leaderboard
+    console.log('📊 Calculating final leaderboard...');
     await updateLeaderboard();
+    console.log('✅ Final leaderboard calculated');
 
+    // ✅ NEW STEP 4: Clear all contest data for fresh start
+    console.log('🧹 Starting contest data cleanup...');
+    const cleanupResult = await clearContestData();
+    
+    if (cleanupResult.success) {
+      console.log('✅ Contest data cleanup completed successfully');
+    } else {
+      console.warn('⚠️ Contest data cleanup completed with errors:', cleanupResult.results.errors);
+    }
+
+    // Step 5: Update contest state
     contestState.isRunning = false;
     contestState.isPaused = false;
 
+    console.log('🛑 ============================================');
+    console.log('🛑 CONTEST STOPPED SUCCESSFULLY');
+    console.log('🛑 ============================================');
+
+    // Step 6: Notify clients
     io.emit('contest_ended', {
       message: 'Contest ended',
       contestId: contestState.contestId,
-      finalLeaderboard: leaderboardCache.slice(0, 10)
+      finalLeaderboard: leaderboardCache.slice(0, 10),
+      cleanupResults: cleanupResult.results
     });
 
-    return { success: true, message: 'Contest stopped successfully' };
+    return { 
+      success: true, 
+      message: 'Contest stopped successfully',
+      cleanup: cleanupResult.results
+    };
 
   } catch (error) {
     console.error('❌ Error stopping contest:', error);
@@ -547,7 +709,7 @@ async function requireAdmin(req, res, next) {
 }
 
 // ============================================
-// PORTFOLIO MANAGEMENT (unchanged calculation, just type safety)
+// PORTFOLIO MANAGEMENT (unchanged)
 // ============================================
 async function getOrCreatePortfolio(userEmail) {
   if (portfolioCache.has(userEmail)) {
@@ -604,7 +766,6 @@ async function updatePortfolioValues(userEmail) {
 
     const holdings = portfolio.holdings || {};
     for (const [symbol, position] of Object.entries(holdings)) {
-      // ✅ TYPE SAFETY: Convert JSONB values to numbers
       const qty = toSafeInteger(position.quantity);
       const avgPrice = toSafeNumber(position.avg_price);
       const currentPrice = toSafeNumber(getCurrentPrice(symbol) || avgPrice);
@@ -616,11 +777,11 @@ async function updatePortfolioValues(userEmail) {
 
         holdings[symbol] = {
           ...position,
-          quantity: qty,               // ✅ Ensure number
-          avg_price: avgPrice,         // ✅ Ensure number
-          current_price: currentPrice, // ✅ Ensure number
-          market_value: positionValue, // ✅ Ensure number
-          unrealized_pnl: (currentPrice - avgPrice) * qty  // ✅ Ensure number
+          quantity: qty,
+          avg_price: avgPrice,
+          current_price: currentPrice,
+          market_value: positionValue,
+          unrealized_pnl: (currentPrice - avgPrice) * qty
         };
       }
     }
@@ -635,7 +796,6 @@ async function updatePortfolioValues(userEmail) {
     let shortUnrealizedPnl = 0;
 
     for (const short of shortPositions || []) {
-      // ✅ TYPE SAFETY
       const shortQty = toSafeInteger(short.quantity);
       const shortPrice = toSafeNumber(short.avg_short_price);
       const currentPrice = toSafeNumber(getCurrentPrice(short.symbol) || shortPrice);
@@ -644,24 +804,22 @@ async function updatePortfolioValues(userEmail) {
       shortUnrealizedPnl += (shortPrice - currentPrice) * shortQty;
     }
 
-    // ✅ TYPE SAFETY: Cash balance
     const cashBalance = toSafeNumber(portfolio.cash_balance);
     const realizedPnl = toSafeNumber(portfolio.realized_pnl);
     
-    // ✅ CORRECT FORMULA: cash already includes short proceeds
     const totalWealth = cashBalance + longMarketValue + shortUnrealizedPnl;
     const totalPnl = longUnrealizedPnl + shortUnrealizedPnl + realizedPnl;
 
     const updatedPortfolio = {
       ...portfolio,
       holdings,
-      cash_balance: cashBalance,           // ✅ Number
-      market_value: longMarketValue,       // ✅ Number
-      short_value: shortValue,             // ✅ Number
-      unrealized_pnl: longUnrealizedPnl + shortUnrealizedPnl,  // ✅ Number
-      total_wealth: totalWealth,           // ✅ Number
-      total_pnl: totalPnl,                 // ✅ Number
-      realized_pnl: realizedPnl,           // ✅ Number
+      cash_balance: cashBalance,
+      market_value: longMarketValue,
+      short_value: shortValue,
+      unrealized_pnl: longUnrealizedPnl + shortUnrealizedPnl,
+      total_wealth: totalWealth,
+      total_pnl: totalPnl,
+      realized_pnl: realizedPnl,
       last_updated: new Date().toISOString()
     };
 
@@ -682,7 +840,7 @@ async function updatePortfolioValues(userEmail) {
 }
 
 // ============================================
-// TRADE EXECUTION - FULLY FIXED WITH ENHANCED TYPE SAFETY
+// TRADE EXECUTION (unchanged - already correct)
 // ============================================
 async function executeTrade(userEmail, symbol, companyName, orderType, quantity, price) {
   try {
@@ -690,7 +848,6 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       throw new Error('Trading is only allowed when contest is running');
     }
 
-    // ✅ ENHANCED TYPE SAFETY: Log incoming values
     console.log('📥 Trade request received:', {
       userEmail,
       symbol,
@@ -701,11 +858,9 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       priceType: typeof price
     });
 
-    // ✅ CRITICAL FIX: Ensure all numeric values are actual numbers
     const numQuantity = toSafeInteger(quantity);
     const numPrice = toSafeNumber(price);
 
-    // ✅ VALIDATION: Ensure conversion succeeded
     if (numQuantity <= 0) {
       throw new Error(`Invalid quantity: ${quantity} (converted to ${numQuantity})`);
     }
@@ -736,21 +891,21 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         const newAvgPrice = ((existingAvg * existingQty) + totalAmount) / newQuantity;
         
         holdings[symbol] = {
-          quantity: newQuantity,              // ✅ INTEGER
-          avg_price: newAvgPrice,             // ✅ NUMERIC
+          quantity: newQuantity,
+          avg_price: newAvgPrice,
           company_name: companyName,
-          current_price: numPrice,            // ✅ NUMERIC
-          market_value: numPrice * newQuantity,  // ✅ NUMERIC
-          unrealized_pnl: (numPrice - newAvgPrice) * newQuantity  // ✅ NUMERIC
+          current_price: numPrice,
+          market_value: numPrice * newQuantity,
+          unrealized_pnl: (numPrice - newAvgPrice) * newQuantity
         };
       } else {
         holdings[symbol] = {
-          quantity: numQuantity,              // ✅ INTEGER
-          avg_price: numPrice,                // ✅ NUMERIC
+          quantity: numQuantity,
+          avg_price: numPrice,
           company_name: companyName,
-          current_price: numPrice,            // ✅ NUMERIC
-          market_value: totalAmount,          // ✅ NUMERIC
-          unrealized_pnl: 0                   // ✅ NUMERIC
+          current_price: numPrice,
+          market_value: totalAmount,
+          unrealized_pnl: 0
         };
       }
 
@@ -765,8 +920,8 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: newCashBalance,  // ✅ NUMERIC
-          holdings                       // ✅ JSONB with numeric values
+          cash_balance: newCashBalance,
+          holdings
         })
         .eq('user_email', userEmail);
 
@@ -792,10 +947,10 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       } else {
         holdings[symbol] = {
           ...holdings[symbol],
-          quantity: newQuantity,                    // ✅ INTEGER
-          current_price: numPrice,                  // ✅ NUMERIC
-          market_value: numPrice * newQuantity,     // ✅ NUMERIC
-          unrealized_pnl: (numPrice - existingAvg) * newQuantity  // ✅ NUMERIC
+          quantity: newQuantity,
+          current_price: numPrice,
+          market_value: numPrice * newQuantity,
+          unrealized_pnl: (numPrice - existingAvg) * newQuantity
         };
       }
 
@@ -815,9 +970,9 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: newCashBalance,    // ✅ NUMERIC
-          holdings,                        // ✅ JSONB with numeric values
-          realized_pnl: newRealizedPnl     // ✅ NUMERIC
+          cash_balance: newCashBalance,
+          holdings,
+          realized_pnl: newRealizedPnl
         })
         .eq('user_email', userEmail);
 
@@ -828,10 +983,10 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           user_email: userEmail,
           symbol,
           company_name: companyName,
-          quantity: numQuantity,           // ✅ INTEGER
-          avg_short_price: numPrice,       // ✅ NUMERIC
-          current_price: numPrice,         // ✅ NUMERIC
-          unrealized_pnl: 0,               // ✅ NUMERIC
+          quantity: numQuantity,
+          avg_short_price: numPrice,
+          current_price: numPrice,
+          unrealized_pnl: 0,
           is_active: true,
           opened_at: new Date().toISOString()
         });
@@ -847,7 +1002,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({ 
-          cash_balance: newCashBalance     // ✅ NUMERIC
+          cash_balance: newCashBalance
         })
         .eq('user_email', userEmail);
 
@@ -885,7 +1040,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
           await supabaseAdmin
             .from('short_positions')
             .update({ 
-              quantity: shortQty - coverQuantity  // ✅ INTEGER
+              quantity: shortQty - coverQuantity
             })
             .eq('id', short.id);
         }
@@ -896,7 +1051,6 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       const currentCash = toSafeNumber(portfolio.cash_balance);
       const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
       
-      // ✅ Deduct cover cost (we're buying shares)
       const newCashBalance = currentCash - totalAmount;
       const newRealizedPnl = currentRealizedPnl + totalPnl;
 
@@ -909,21 +1063,20 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       await supabaseAdmin
         .from('portfolio')
         .update({
-          cash_balance: newCashBalance,    // ✅ NUMERIC
-          realized_pnl: newRealizedPnl     // ✅ NUMERIC
+          cash_balance: newCashBalance,
+          realized_pnl: newRealizedPnl
         })
         .eq('user_email', userEmail);
     }
 
-    // ✅ CRITICAL: Final type safety check before database insert
     const safeTradeData = {
       user_email: userEmail,
       symbol,
       company_name: companyName,
       order_type: orderType,
-      quantity: Math.floor(numQuantity),           // ✅ Force INTEGER
-      price: parseFloat(numPrice.toFixed(2)),      // ✅ Force NUMERIC with 2 decimals
-      total_amount: parseFloat(totalAmount.toFixed(2)), // ✅ Force NUMERIC
+      quantity: Math.floor(numQuantity),
+      price: parseFloat(numPrice.toFixed(2)),
+      total_amount: parseFloat(totalAmount.toFixed(2)),
       timestamp: new Date().toISOString()
     };
 
@@ -934,7 +1087,6 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       priceType: typeof safeTradeData.price
     });
 
-    // Record trade with type-safe values
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
       .insert(safeTradeData)
@@ -1274,6 +1426,21 @@ app.post('/api/admin/contest/stop', authenticateToken, requireAdmin, async (req,
   }
 });
 
+// ✅ NEW ENDPOINT: Manual data reset (for admin debugging)
+app.post('/api/admin/contest/reset-data', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    console.log('🔧 Admin triggered manual data reset');
+    const result = await clearContestData();
+    res.json({
+      success: result.success,
+      message: result.success ? 'Data reset completed' : 'Data reset completed with errors',
+      details: result.results
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/admin/contest/pause', authenticateToken, requireAdmin, async (req, res) => {
   try {
     if (!contestState.isRunning) {
@@ -1420,7 +1587,7 @@ setInterval(async () => {
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`
-🚀 TRADING PLATFORM - FIXED VERSION
+🚀 TRADING PLATFORM - COMPLETE FIXED VERSION
 ========================================
 📍 Port: ${PORT}
 📊 WebSocket: Enabled
@@ -1428,8 +1595,9 @@ server.listen(PORT, () => {
 💾 Database: Connected
 🕐 Contest: 1 hour (5x speed)
 📈 Timeframes: ${Object.keys(TIMEFRAMES).join(', ')}
-🎯 Type Safety: FULL (Enhanced)
+🎯 Type Safety: FULL
 🔧 Auto Square-Off: FIXED
+🧹 Data Reset: IMPLEMENTED
 ✅ Ready for 200+ users
 ========================================
 ✅ Server ready!
