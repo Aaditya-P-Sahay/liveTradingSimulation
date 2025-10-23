@@ -37,6 +37,19 @@ const io = new Server(server, {
   pingInterval: 25000
 });
 
+// Monkey-patch fetch to inspect Supabase payloads for debugging JSONB issue
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url, options = {}) => {
+  if (typeof url === 'string' && url.includes('/rest/v1/trades') && options?.body) {
+    try {
+      console.log('🐞 Supabase trade insert payload:', options.body);
+    } catch (err) {
+      console.warn('⚠️ Unable to log Supabase payload:', err);
+    }
+  }
+  return originalFetch(url, options);
+};
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false }
@@ -562,15 +575,24 @@ async function stopContest() {
         if (portfolio) {
           const currentCash = toSafeNumber(portfolio.cash_balance);
           const currentRealizedPnl = toSafeNumber(portfolio.realized_pnl);
+          const currentShortValue = toSafeNumber(portfolio.short_value);
+          const currentUnrealizedPnl = toSafeNumber(portfolio.unrealized_pnl);
+          
+          // Calculate the short's unrealized PnL that was in unrealized_pnl field
+          const shortUnrealizedPnl = (shortPrice - currentPrice) * shortQty;
           
           const newCashBalance = currentCash - coverCost;
           const newRealizedPnl = currentRealizedPnl + pnl;
+          const newShortValue = Math.max(0, currentShortValue - (currentPrice * shortQty));
+          const newUnrealizedPnl = currentUnrealizedPnl - shortUnrealizedPnl;
 
           await supabaseAdmin
             .from('portfolio')
             .update({
               cash_balance: newCashBalance,
-              realized_pnl: newRealizedPnl
+              realized_pnl: newRealizedPnl,
+              short_value: newShortValue,
+              unrealized_pnl: newUnrealizedPnl
             })
             .eq('user_email', short.user_email);
 
@@ -601,12 +623,49 @@ async function stopContest() {
       console.log('ℹ️ No active short positions to square-off');
     }
 
-    // Step 3: Update final leaderboard
+    // Step 3: Recalculate all portfolio values after auto square-off
+    console.log('📊 Recalculating all portfolio values after auto square-off...');
+    const { data: allPortfolios } = await supabaseAdmin
+      .from('portfolio')
+      .select('user_email');
+    
+    if (allPortfolios) {
+      for (const p of allPortfolios) {
+        await updatePortfolioValues(p.user_email);
+      }
+      console.log(`✅ Updated ${allPortfolios.length} portfolios`);
+    }
+
+    // Step 4: Update final leaderboard (AFTER portfolio recalculation)
     console.log('📊 Calculating final leaderboard...');
     await updateLeaderboard();
     console.log('✅ Final leaderboard calculated');
 
-    // ✅ NEW STEP 4: Clear all contest data for fresh start
+    // Step 5: Store final contest results
+    const finalLeaderboard = leaderboardCache.slice(0, 100); // Top 100
+    const winner = finalLeaderboard[0] || null;
+    
+    try {
+      await supabaseAdmin
+        .from('contest_results')
+        .insert({
+          contest_id: contestState.contestId,
+          end_time: new Date().toISOString(),
+          final_leaderboard: finalLeaderboard,
+          total_participants: connectedUsers.size,
+          winner: winner ? {
+            user_email: winner.user_email,
+            user_name: winner.user_name,
+            total_wealth: winner.total_wealth,
+            return_percentage: winner.return_percentage
+          } : null
+        });
+      console.log('✅ Final contest results saved to database');
+    } catch (resultError) {
+      console.error('⚠️ Failed to save contest results:', resultError.message);
+    }
+
+    // ✅ STEP 6: Clear all contest data for fresh start
     console.log('🧹 Starting contest data cleanup...');
     const cleanupResult = await clearContestData();
     
@@ -616,7 +675,7 @@ async function stopContest() {
       console.warn('⚠️ Contest data cleanup completed with errors:', cleanupResult.results.errors);
     }
 
-    // Step 5: Update contest state
+    // Step 7: Update contest state
     contestState.isRunning = false;
     contestState.isPaused = false;
 
@@ -624,17 +683,21 @@ async function stopContest() {
     console.log('🛑 CONTEST STOPPED SUCCESSFULLY');
     console.log('🛑 ============================================');
 
-    // Step 6: Notify clients
+    // Step 8: Notify clients
     io.emit('contest_ended', {
       message: 'Contest ended',
       contestId: contestState.contestId,
-      finalLeaderboard: leaderboardCache.slice(0, 10),
+      finalLeaderboard: finalLeaderboard.slice(0, 10),
+      winner: winner,
+      totalParticipants: connectedUsers.size,
       cleanupResults: cleanupResult.results
     });
 
     return { 
       success: true, 
       message: 'Contest stopped successfully',
+      finalLeaderboard: finalLeaderboard.slice(0, 10),
+      winner: winner,
       cleanup: cleanupResult.results
     };
 
@@ -854,10 +917,13 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
       orderType,
       quantity,
       quantityType: typeof quantity,
+      quantityValue: JSON.stringify(quantity),
       price,
-      priceType: typeof price
+      priceType: typeof price,
+      priceValue: JSON.stringify(price)
     });
 
+    // Convert to primitive number types explicitly
     const numQuantity = toSafeInteger(quantity);
     const numPrice = toSafeNumber(price);
 
@@ -1069,33 +1135,58 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
         .eq('user_email', userEmail);
     }
 
+    // Ensure all values are primitive types using valueOf() to extract primitives
+    const safeQuantity = Math.floor(Number(numQuantity).valueOf());
+    const safePrice = parseFloat(Number(numPrice).toFixed(2));
+    const safeTotalAmount = parseFloat(Number(totalAmount).toFixed(2));
+
+    // Create trade data with explicit primitive types
     const safeTradeData = {
       user_email: userEmail,
-      symbol,
+      symbol: symbol,
       company_name: companyName,
       order_type: orderType,
-      quantity: Math.floor(numQuantity),
-      price: parseFloat(numPrice.toFixed(2)),
-      total_amount: parseFloat(totalAmount.toFixed(2)),
-      timestamp: new Date().toISOString()
+      quantity: safeQuantity,
+      price: safePrice,
+      total_amount: safeTotalAmount
     };
 
-    console.log('📝 Inserting trade with sanitized data:', {
-      quantity: safeTradeData.quantity,
-      quantityType: typeof safeTradeData.quantity,
-      price: safeTradeData.price,
-      priceType: typeof safeTradeData.price
+    // Verify all types are correct
+    console.log('📝 Inserting trade with verified primitive types:', {
+      user_email: typeof safeTradeData.user_email,
+      symbol: typeof safeTradeData.symbol,
+      quantity: typeof safeTradeData.quantity,
+      quantityValue: safeTradeData.quantity,
+      isInteger: Number.isInteger(safeTradeData.quantity),
+      price: typeof safeTradeData.price,
+      priceValue: safeTradeData.price,
+      total_amount: typeof safeTradeData.total_amount
     });
 
+    // Insert into database - use array syntax to prevent JSONB conversion
     const { data: trade, error } = await supabaseAdmin
       .from('trades')
-      .insert(safeTradeData)
+      .insert([{
+        user_email: String(userEmail),
+        symbol: String(symbol),
+        company_name: String(companyName),
+        order_type: String(orderType),
+        quantity: parseInt(safeQuantity, 10),
+        price: parseFloat(safePrice),
+        total_amount: parseFloat(safeTotalAmount)
+      }])
       .select()
       .single();
 
     if (error) {
-      console.error('❌ Trade insertion error:', error);
-      throw error;
+      console.error('❌ Trade insertion error:', {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        dataBeingInserted: safeTradeData
+      });
+      throw new Error(`Database error: ${error.message}`);
     }
 
     console.log(`✅ Trade executed successfully: ${orderType} ${numQuantity} ${symbol} @ ₹${numPrice}`);
@@ -1110,7 +1201,7 @@ async function executeTrade(userEmail, symbol, companyName, orderType, quantity,
 }
 
 // ============================================
-// LEADERBOARD (unchanged)
+// LEADERBOARD (with database storage)
 // ============================================
 async function updateLeaderboard() {
   try {
@@ -1142,7 +1233,29 @@ async function updateLeaderboard() {
     }));
 
     leaderboardCache = leaderboard;
+    
+    // Emit to all connected users
     io.emit('leaderboard_update', leaderboard.slice(0, 20));
+
+    // ✅ NEW: Store current leaderboard snapshot in database (if contest is running)
+    if (contestState.isRunning && contestState.contestId) {
+      try {
+        // Update or insert the current contest's leaderboard state
+        const { error: upsertError } = await supabaseAdmin
+          .from('contest_state')
+          .update({
+            current_leaderboard: leaderboard.slice(0, 100), // Store top 100
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', contestState.contestId);
+        
+        if (upsertError) {
+          console.warn('⚠️ Could not update contest leaderboard in DB:', upsertError.message);
+        }
+      } catch (dbError) {
+        console.warn('⚠️ Leaderboard DB storage error:', dbError.message);
+      }
+    }
 
     return leaderboard;
   } catch (error) {
@@ -1437,6 +1550,60 @@ app.post('/api/admin/contest/reset-data', authenticateToken, requireAdmin, async
       details: result.results
     });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ NEW: Debug endpoint to test trade insertion
+app.post('/api/debug/test-trade-insert', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const testData = {
+      user_email: req.user["Candidate's Email"],
+      symbol: 'TEST',
+      company_name: 'Test Company',
+      order_type: 'buy',
+      quantity: 10,
+      price: 100.50,
+      total_amount: 1005.00
+    };
+
+    console.log('🧪 Testing trade insertion with data:', {
+      data: testData,
+      types: {
+        quantity: typeof testData.quantity,
+        quantity_is_integer: Number.isInteger(testData.quantity),
+        price: typeof testData.price,
+        total_amount: typeof testData.total_amount
+      }
+    });
+
+    const { data, error } = await supabaseAdmin
+      .from('trades')
+      .insert(testData)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('❌ Test trade insertion failed:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint
+      });
+    }
+
+    // Clean up test trade
+    await supabaseAdmin.from('trades').delete().eq('id', data.id);
+
+    res.json({
+      success: true,
+      message: 'Trade insertion test passed',
+      insertedData: data
+    });
+  } catch (error) {
+    console.error('❌ Test trade error:', error);
     res.status(500).json({ error: error.message });
   }
 });
